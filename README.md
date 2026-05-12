@@ -1,6 +1,6 @@
-# Consistency DEQ — Official Implementation
+# Consistency DEQ
 
-This repository provides the official codebase for **Consistency DEQ**, accompanying the ICML paper. It is released as supplementary material and includes three tasks across four datasets. The implementation centers on **Consistency Model (CM)** based inference as the primary method.
+This repository provides the official codebase for **Consistency DEQ**. It includes three tasks across four datasets. The implementation centers on **Consistency Model** based inference as the primary method.
 
 
 
