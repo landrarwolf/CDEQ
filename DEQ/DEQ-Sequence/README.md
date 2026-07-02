@@ -10,6 +10,10 @@ python train_transformer.py
 Old forked scripts were removed. Use command flags instead of editing comments
 inside the code.
 
+CDEQ trajectory generation, CM training, and CM inference must use the same
+`--trajectory-solver`. Only `picard` and `anderson` are supported here.
+The legacy Broyden solver is intentionally not exposed in this maintained path.
+
 ## Required Local Artifacts
 
 These files are runtime inputs and must stay out of Git:
@@ -51,6 +55,7 @@ python train_transformer.py \
   --debug \
   --gpu-count 1 \
   --train-CM \
+  --trajectory-solver picard \
   --trajectory-prefix traj_all \
   --cm-start-file-idx 1 \
   --cm-max-file-idx 9 \
@@ -65,6 +70,7 @@ python train_transformer.py \
   --debug \
   --gpu-count 1 \
   -CM \
+  --trajectory-solver picard \
   --cm-load best_CM_model.pth \
   --max_eval_steps 1
 ```
@@ -79,12 +85,12 @@ python train_transformer.py --debug --gpu-count 1 --save-trajectory \
   --deq-func-load ./models/pretrained_deq_func.pth --f_thres 4 --max_eval_steps 1
 
 python train_transformer.py --debug --gpu-count 1 --train-CM \
-  --trajectory-prefix /tmp/cdeq_refactor_smoke --cm-start-file-idx 1 \
+  --trajectory-solver picard --trajectory-prefix /tmp/cdeq_refactor_smoke --cm-start-file-idx 1 \
   --cm-max-file-idx 1 --cm-max-traj-per-file 1 --cm-num-samples 1 \
   --cm-epochs 1 --cm-batch-size 1 --cm-train-points 4 \
   --cm-save /tmp/cdeq_refactor_cm_smoke.pth \
   --cm-checkpoint /tmp/cdeq_refactor_cm_smoke.pt --max_eval_steps 1
 
 python train_transformer.py --debug --gpu-count 1 -CM \
-  --cm-load /tmp/cdeq_refactor_cm_smoke.pth --max_eval_steps 1
+  --trajectory-solver picard --cm-load /tmp/cdeq_refactor_cm_smoke.pth --max_eval_steps 1
 ```

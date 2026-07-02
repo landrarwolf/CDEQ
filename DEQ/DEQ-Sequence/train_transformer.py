@@ -22,7 +22,7 @@ for path in (str(SEQ_DIR), str(DEQ_DIR)):
         sys.path.insert(0, path)
 
 from data_utils import get_lm_corpus
-from lib.solvers import anderson, broyden
+from lib.solvers import anderson
 from models.deq_transformer import DEQTransformerLM
 from models.deq_transformer_CD import ConsistencyFunction
 from utils.data_parallel import BalancedDataParallel
@@ -31,7 +31,6 @@ from utils.exp_utils import create_exp_dir
 
 SOLVERS = {
     "anderson": anderson,
-    "broyden": broyden,
 }
 
 
@@ -105,8 +104,8 @@ def build_parser():
                         help="local horizon size")
     parser.add_argument("--f_solver", default="anderson", choices=sorted(SOLVERS),
                         help="forward fixed-point solver")
-    parser.add_argument("--b_solver", default="broyden",
-                        choices=["anderson", "broyden", "None"],
+    parser.add_argument("--b_solver", default="None",
+                        choices=["anderson", "None"],
                         help="backward fixed-point solver")
     parser.add_argument("--stop_mode", type=str, default="rel", choices=["abs", "rel"],
                         help="solver stop criterion")
@@ -185,7 +184,7 @@ def build_parser():
     parser.add_argument("--trajectory-prefix", type=str, default="traj_all",
                         help="prefix for saved/loaded trajectory files")
     parser.add_argument("--trajectory-solver", choices=["anderson", "picard"], default="anderson",
-                        help="solver used to generate saved trajectories")
+                        help="solver used for saved trajectories and CM training/inference")
     parser.add_argument("--train-CM", "--train-cm", dest="train_CM", action="store_true",
                         help="train the consistency model")
     parser.add_argument("-CM", "--CM", dest="CM", action="store_true",
@@ -458,6 +457,7 @@ def evaluate(args, eval_iter, model, para_model, logging, save_trajectory=False,
                 kwargs = {}
                 if cm_load is not None:
                     kwargs["CM_load"] = cm_load
+                    kwargs["CM_solver"] = args.trajectory_solver
                 ret = para_model(
                     data,
                     target,
@@ -573,6 +573,7 @@ def train_consistency_model(args, device, device_ids, func_params_dict):
         dropout=args.dropout,
         n_layer=args.n_layer,
         func_args=None,
+        solver=args.trajectory_solver,
     ).to(device)
     cd.func.load_state_dict(func_params_dict)
     optimizer = torch.optim.AdamW(cd.parameters(), lr=4e-3)
@@ -584,6 +585,7 @@ def train_consistency_model(args, device, device_ids, func_params_dict):
         dropout=args.dropout,
         n_layer=args.n_layer,
         func_args=None,
+        solver=args.trajectory_solver,
     ).to(device)
     cd_ema.load_state_dict(cd.state_dict())
     params_ema = cd_ema.state_dict()
@@ -630,8 +632,17 @@ def train_consistency_model(args, device, device_ids, func_params_dict):
     for idx, (file_idx, traj_idx) in enumerate(sampled_trajectories):
         print(f"正在处理第 {idx + 1}/{args.cm_num_samples} 条轨迹，来自文件 {args.trajectory_prefix}_{file_idx}.pt 中的第 {traj_idx} 条")
         traj = torch.load(f"{args.trajectory_prefix}_{file_idx}.pt", map_location=device)
-        x_list = [item["x_traj"] for item in traj][traj_idx]
-        func_args = [[item["func_args"][0], item["func_args"][1], item["func_args"][2]] for item in traj][traj_idx]
+        item = traj[traj_idx]
+        saved_solver = item.get("trajectory_solver")
+        if saved_solver is not None and saved_solver != args.trajectory_solver:
+            raise ValueError(
+                f"Trajectory solver mismatch: file uses {saved_solver}, "
+                f"but --trajectory-solver is {args.trajectory_solver}"
+            )
+        if saved_solver is None:
+            print(f"轨迹未记录solver，按 --trajectory-solver={args.trajectory_solver} 处理")
+        x_list = item["x_traj"]
+        func_args = [item["func_args"][0], item["func_args"][1], item["func_args"][2]]
         x_traj = x_list.permute(1, 0, 2, 3)
         bsz = x_traj.shape[0]
 

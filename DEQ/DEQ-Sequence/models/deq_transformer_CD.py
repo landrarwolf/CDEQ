@@ -12,7 +12,6 @@ import os
 sys.path.append('../../')
 
 from lib.optimizations import weight_norm, VariationalDropout, VariationalHidDropout, VariationalAttnDropout
-from lib.solvers import anderson, broyden
 from lib.jacobian import jac_loss_estimate, power_method
 
 from utils.adaptive_embedding import AdaptiveEmbedding
@@ -314,10 +313,11 @@ def anderson_step(z_curr, z_prev, f_curr, f_prev, beta=1.0):
 
 
 class ConsistencyFunction(nn.Module):
-    def __init__(self, n_head, d_model, d_head, d_inner, dropout, n_layer, func_args=None):
+    def __init__(self, n_head, d_model, d_head, d_inner, dropout, n_layer, func_args=None, solver='anderson'):
         super().__init__()
         if func_args is not None:
             self.update_func_args(func_args)
+        self.set_solver(solver)
 
         self.d_model = d_model
         self.embedding = nn.Sequential(
@@ -332,6 +332,11 @@ class ConsistencyFunction(nn.Module):
         wnorm = True
         if wnorm: self.func.wnorm()
         self.n_layer = n_layer
+
+    def set_solver(self, solver):
+        if solver not in ('anderson', 'picard'):
+            raise ValueError("ConsistencyFunction solver must be 'anderson' or 'picard'")
+        self.solver = solver
 
     def update_func_args(self, func_args):
         self.func_args = func_args
@@ -361,17 +366,17 @@ class ConsistencyFunction(nn.Module):
         self.pos_drop.reset_mask(bsz, self.d_model, klen)
         self.func.reset(bsz, qlen, klen)
 
-        # Traverse trajectory points and execute Anderson Acceleration
+        # Traverse trajectory points using the same solver family as the saved trajectory.
         for b in range(n_steps):
             z_curr = z1s[:, b]  # [bsz, d_model, qlen]
             z_prev = z1s_1[:, b]  # [bsz, d_model, qlen]
 
-            # Calculate the function values of two steps
             f_curr = self.func(z_curr, *func_args)
-            f_prev = self.func(z_prev, *func_args)
-
-            # Use AA to get the accelerated output
-            inputs[:, b] = anderson_step(z_curr, z_prev, f_curr, f_prev, beta=1.0)
+            if self.solver == 'picard':
+                inputs[:, b] = f_curr
+            else:
+                f_prev = self.func(z_prev, *func_args)
+                inputs[:, b] = anderson_step(z_curr, z_prev, f_curr, f_prev, beta=1.0)
 
         # Subsequent embedding and interpolation logic
         input_t = torch.cat([inputs, t.view(bsz, n_steps, 1, 1).tile(1, 1, 1, qlen)], dim=-2)

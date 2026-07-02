@@ -18,7 +18,7 @@ import time
 sys.path.append('../../')
 
 from lib.optimizations import weight_norm, VariationalDropout, VariationalHidDropout, VariationalAttnDropout
-from lib.solvers import anderson, broyden
+from lib.solvers import anderson
 from lib.jacobian import jac_loss_estimate, power_method
 
 from utils.adaptive_embedding import AdaptiveEmbedding
@@ -147,7 +147,7 @@ class DEQTransformerLM(nn.Module):
 
     def _forward(self, dec_inp, mems=None, f_thres=30, b_thres=40, train_step=-1,
                  compute_jac_loss=True, spectral_radius_mode=False, writer=None, save_trajectory=False,
-                 trajectory_solver='anderson', CM_load=None):
+                 trajectory_solver='anderson', CM_load=None, CM_solver='anderson'):
         """
         Apply the DEQ-Transformer language model on input word tokens
 
@@ -221,11 +221,13 @@ class DEQTransformerLM(nn.Module):
                     trajectory = {
                         'x_traj': x_traj,  # x_traj.shape = torch.Size([39, 2, 700, 150])
                         'func_args': func_args,  # func_args = [us, z0, pos_emb]
+                        'trajectory_solver': trajectory_solver,
                     }
 
                 if CM_load is not None:  # CM_load = 'best_CM_model_.pth'
                     T = 5
                     t = torch.tensor(T).to(dec_inp.device).view(1, 1).expand(bsz, 1)
+                    self.CD.set_solver(CM_solver)
                     self.CD.load_state_dict(torch.load(CM_load, map_location=dec_inp.device))
 
                     time_start = time.time()
@@ -298,6 +300,7 @@ class DEQTransformerLM(nn.Module):
         save_trajectory = kwargs.get('save_trajectory', False)
         trajectory_solver = kwargs.get('trajectory_solver', 'anderson')
         CM_load = kwargs.get('CM_load', None)
+        CM_solver = kwargs.get('CM_solver', trajectory_solver)
         hidden, new_mems, jac_loss, sradius, trajectory = self._forward(data, mems=mems, f_thres=f_thres, b_thres=b_thres,
                                                             train_step=train_step,
                                                             compute_jac_loss=compute_jac_loss,
@@ -306,6 +309,7 @@ class DEQTransformerLM(nn.Module):
                                                             save_trajectory=save_trajectory,
                                                             trajectory_solver=trajectory_solver,
                                                             CM_load=CM_load,
+                                                            CM_solver=CM_solver,
                                                             )
         pred_hid = hidden[-tgt_len:]
         loss = self.crit(pred_hid.view(-1, pred_hid.size(-1)), target.contiguous().view(-1))
