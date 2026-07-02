@@ -527,6 +527,10 @@ def evaluate(eval_iter):
                 message += f", rel_diff:{rel_diff.float():.4f}"
             print(message)  # 0.27s
 
+        if save_trajectory and traj_all:
+            filename = f'{args.trajectory_prefix}_{i // 10 + 1}.pt'
+            torch.save(traj_all, filename)
+            print(f"Saved final trajectory data!, traj_all_len={len(traj_all)}")
 
     if rho_list:
         logging(f"(Estimated) Spectral radius over validation set: {np.mean(rho_list)}")
