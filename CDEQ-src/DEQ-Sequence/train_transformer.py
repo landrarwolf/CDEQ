@@ -191,6 +191,8 @@ def build_parser():
                         help="use the trained consistency model during evaluation")
     parser.add_argument("--cm-load", type=str, default="best_CM_model.pth",
                         help="path to a trained consistency model")
+    parser.add_argument("--cm-compare-teacher", action="store_true",
+                        help="also run the DEQ teacher solver during CM evaluation and print relative error")
     parser.add_argument("--cm-save", type=str, default="best_CM_model.pth",
                         help="path to save the best trained consistency model")
     parser.add_argument("--cm-checkpoint", type=str, default="cm_checkpoint/cm_checkpoint.pt",
@@ -458,6 +460,7 @@ def evaluate(args, eval_iter, model, para_model, logging, save_trajectory=False,
                 if cm_load is not None:
                     kwargs["CM_load"] = cm_load
                     kwargs["CM_solver"] = args.trajectory_solver
+                    kwargs["CM_compare_teacher"] = args.cm_compare_teacher
                 ret = para_model(
                     data,
                     target,

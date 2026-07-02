@@ -93,6 +93,7 @@ class DEQTransformerLM(nn.Module):
         # Consistency Distrillation
         self.CD = ConsistencyFunction(n_head=n_head, d_model=d_model, d_head=d_head, d_inner=d_inner,
                                  dropout=dropout, n_layer=n_layer)
+        self._cm_state_cache = {}
 
         # save and load the weights of func
         # self.save_func_weights("./models/")
@@ -118,6 +119,12 @@ class DEQTransformerLM(nn.Module):
         with open(os.path.join(path, f'{name}.pth'), 'wb') as f:
             self.logging(f"Saving weight state dict at {name}.pth")
             torch.save(self.func.state_dict(), f)
+
+    def load_cm_weights(self, path, device):
+        key = (path, str(device))
+        if key not in self._cm_state_cache:
+            self._cm_state_cache[key] = torch.load(path, map_location=device)
+        self.CD.load_state_dict(self._cm_state_cache[key])
 
     def init_mems(self):
         if self.mem_len <= 0:
@@ -147,7 +154,7 @@ class DEQTransformerLM(nn.Module):
 
     def _forward(self, dec_inp, mems=None, f_thres=30, b_thres=40, train_step=-1,
                  compute_jac_loss=True, spectral_radius_mode=False, writer=None, save_trajectory=False,
-                 trajectory_solver='picard', CM_load=None, CM_solver='picard'):
+                 trajectory_solver='picard', CM_load=None, CM_solver='picard', CM_compare_teacher=False):
         """
         Apply the DEQ-Transformer language model on input word tokens
 
@@ -202,18 +209,23 @@ class DEQTransformerLM(nn.Module):
                 # 有效的input仅为mems=[us, z0]
                 # output: result['result'], result['X_list']
                 time_start = time.time()
-                if save_trajectory and trajectory_solver == 'picard':
+                run_teacher_solver = save_trajectory or CM_load is None or CM_compare_teacher
+                use_picard_teacher = trajectory_solver == 'picard' and (save_trajectory or CM_compare_teacher)
+                X_list = []
+                if run_teacher_solver and use_picard_teacher:
                     X_list = []
                     for _ in range(f_thres):
                         z1s = self.func(z1s, *func_args)
                         X_list.append(z1s.clone().detach())
                     new_z1s = z1s
-                else:
+                elif run_teacher_solver:
                     result = self.f_solver(lambda z: self.func(z, *func_args), z1s, threshold=f_thres,
                                            stop_mode=self.stop_mode)
                     # print(f"Time of anderson_solver: {time.time() - time_start}")
                     new_z1s = result['result']  # torch.Size([16, 700, 150])
                     X_list = result.get('X_list', [])
+                else:
+                    new_z1s = z1s
                 if save_trajectory:
                     x_traj = torch.stack(X_list, dim=0)  # 列表堆叠成矩阵
                     # Save x_traj_stqueezed, us, z0,
@@ -228,7 +240,7 @@ class DEQTransformerLM(nn.Module):
                     T = 5
                     t = torch.tensor(T).to(dec_inp.device).view(1, 1).expand(bsz, 1)
                     self.CD.set_solver(CM_solver)
-                    self.CD.load_state_dict(torch.load(CM_load, map_location=dec_inp.device))
+                    self.load_cm_weights(CM_load, dec_inp.device)
 
                     time_start = time.time()
                     z1s_step = z1s.unsqueeze(1)
@@ -241,8 +253,9 @@ class DEQTransformerLM(nn.Module):
                     # z1s = self.f_solver(lambda z: self.func(z, *func_args), z1s, threshold=f_thres,
                     #                     stop_mode=self.stop_mode)['result']
 
-                    rel_diff = (z1s - new_z1s).norm() / new_z1s.norm()
-                    print(f"Relative error: {rel_diff.item()}")  # 0.2233
+                    if CM_compare_teacher:
+                        rel_diff = (z1s - new_z1s).norm() / new_z1s.norm()
+                        print(f"Relative error: {rel_diff.item()}")  # 0.2233
 
                     new_z1s = z1s
 
@@ -301,6 +314,7 @@ class DEQTransformerLM(nn.Module):
         trajectory_solver = kwargs.get('trajectory_solver', 'picard')
         CM_load = kwargs.get('CM_load', None)
         CM_solver = kwargs.get('CM_solver', trajectory_solver)
+        CM_compare_teacher = kwargs.get('CM_compare_teacher', False)
         hidden, new_mems, jac_loss, sradius, trajectory = self._forward(data, mems=mems, f_thres=f_thres, b_thres=b_thres,
                                                             train_step=train_step,
                                                             compute_jac_loss=compute_jac_loss,
@@ -310,6 +324,7 @@ class DEQTransformerLM(nn.Module):
                                                             trajectory_solver=trajectory_solver,
                                                             CM_load=CM_load,
                                                             CM_solver=CM_solver,
+                                                            CM_compare_teacher=CM_compare_teacher,
                                                             )
         pred_hid = hidden[-tgt_len:]
         loss = self.crit(pred_hid.view(-1, pred_hid.size(-1)), target.contiguous().view(-1))

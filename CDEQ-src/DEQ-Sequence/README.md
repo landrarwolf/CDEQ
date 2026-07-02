@@ -73,6 +73,10 @@ python train_transformer.py \
   --max_eval_steps 1
 ```
 
+By default `-CM` runs only the consistency model. Add
+`--cm-compare-teacher` when you also want to run the DEQ teacher solver and
+print the relative error for debugging.
+
 ## Smoke Test
 
 For a fast implementation check, use a temporary prefix and tiny limits:

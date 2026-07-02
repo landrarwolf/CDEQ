@@ -47,6 +47,7 @@ Last updated: 2026-07-02.
    - Loads `--cm-load`.
    - Sets CM solver from `--trajectory-solver`.
    - Default is one-step CM inference toward the equilibrium approximation.
+   - `--cm-compare-teacher` is debug-only: it also runs the DEQ teacher solver and prints relative error, so it should not be used for speed measurements.
 
 ## Paper Match
 
