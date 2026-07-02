@@ -14,6 +14,8 @@ CDEQ trajectory generation, CM training, and CM inference must use the same
 `--trajectory-solver`. The default is `picard`; `anderson` is only for explicit
 solver experiments.
 The legacy Broyden solver is intentionally not exposed in this maintained path.
+Trajectory generation skips an existing cache when `dataset`, solver, `f_thres`,
+and `max_eval_steps` match; use `--force-trajectory-regen` to overwrite it.
 
 ## Required Local Artifacts
 

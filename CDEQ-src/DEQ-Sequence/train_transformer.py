@@ -187,6 +187,8 @@ def build_parser():
                         help="prefix for saved/loaded trajectory files")
     parser.add_argument("--trajectory-solver", choices=["picard", "anderson"], default="picard",
                         help="solver used for saved trajectories and CM training/inference")
+    parser.add_argument("--force-trajectory-regen", action="store_true",
+                        help="overwrite existing trajectory cache for this prefix")
     parser.add_argument("--train-CM", "--train-cm", dest="train_CM", action="store_true",
                         help="train the consistency model")
     parser.add_argument("-CM", "--CM", dest="CM", action="store_true",
@@ -435,6 +437,79 @@ def to_cpu(obj):
     return obj
 
 
+def find_trajectory_files(prefix):
+    prefix_path = Path(prefix)
+    parent = prefix_path.parent if str(prefix_path.parent) else Path(".")
+    files = list(parent.glob(f"{prefix_path.name}_*.pt"))
+
+    def suffix_num(path):
+        try:
+            return int(path.stem.rsplit("_", 1)[1])
+        except (IndexError, ValueError):
+            return 10**12
+
+    return sorted(files, key=suffix_num)
+
+
+def trajectory_cache_expected(args):
+    return {
+        "dataset": args.dataset,
+        "trajectory_solver": args.trajectory_solver,
+        "f_thres": args.f_thres,
+        "max_eval_steps": args.max_eval_steps,
+    }
+
+
+def trajectory_cache_hit(args):
+    if args.force_trajectory_regen:
+        return False
+    files = find_trajectory_files(args.trajectory_prefix)
+    if not files:
+        return False
+
+    expected = trajectory_cache_expected(args)
+    sample_files = [files[0]]
+    if files[-1] != files[0]:
+        sample_files.append(files[-1])
+
+    for path in sample_files:
+        try:
+            traj_file = torch.load(path, map_location="cpu")
+        except Exception as exc:
+            raise RuntimeError(
+                f"Existing trajectory cache is unreadable: {path}. "
+                "Use --force-trajectory-regen to overwrite it."
+            ) from exc
+        if not isinstance(traj_file, list) or not traj_file or not isinstance(traj_file[0], dict):
+            raise RuntimeError(
+                f"Existing trajectory cache has invalid format: {path}. "
+                "Use --force-trajectory-regen to overwrite it."
+            )
+        item = traj_file[0]
+        for key, expected_value in expected.items():
+            actual_value = item.get(key)
+            if actual_value != expected_value:
+                raise RuntimeError(
+                    f"Existing trajectory cache mismatch in {path}: "
+                    f"{key}={actual_value!r}, expected {expected_value!r}. "
+                    "Use --force-trajectory-regen to overwrite it."
+                )
+
+    print(
+        f"Trajectory cache hit for dataset={args.dataset}, "
+        f"solver={args.trajectory_solver}: {len(files)} files under {args.trajectory_prefix}_*.pt"
+    )
+    return True
+
+
+def clear_trajectory_cache(args):
+    if not args.force_trajectory_regen:
+        return
+    for path in find_trajectory_files(args.trajectory_prefix):
+        path.unlink()
+        print(f"Removed existing trajectory cache file: {path}")
+
+
 def evaluate(args, eval_iter, model, para_model, logging, save_trajectory=False, cm_load=None):
     train_step = int(1e9)
     model.eval()
@@ -469,6 +544,9 @@ def evaluate(args, eval_iter, model, para_model, logging, save_trajectory=False,
                     trajectory_solver=args.trajectory_solver,
                 )
                 loss, _, sradius, trajectory, mems = ret[0], ret[1], ret[2], ret[3], ret[4:]
+                trajectory["dataset"] = args.dataset
+                trajectory["f_thres"] = args.f_thres
+                trajectory["max_eval_steps"] = args.max_eval_steps
                 traj_all.append(to_cpu(trajectory))
                 if i % 10 == 0 and i != 0:
                     filename = f"{args.trajectory_prefix}_{i // 10}.pt"
@@ -666,6 +744,14 @@ def train_consistency_model(args, device, device_ids, func_params_dict):
             )
         if saved_solver is None:
             print(f"轨迹未记录solver，按 --trajectory-solver={args.trajectory_solver} 处理")
+        saved_dataset = item.get("dataset")
+        if saved_dataset is not None and saved_dataset != args.dataset:
+            raise ValueError(
+                f"Trajectory dataset mismatch: file uses {saved_dataset}, "
+                f"but --dataset is {args.dataset}"
+            )
+        if saved_dataset is None:
+            print(f"轨迹未记录dataset，按 --dataset={args.dataset} 处理")
         x_list = item["x_traj"]
         func_args = [item["func_args"][0], item["func_args"][1], item["func_args"][2]]
         x_traj = x_list.permute(1, 0, 2, 3)
@@ -738,6 +824,9 @@ def log_valid_loss(logging, label, valid_loss):
 
 def run(argv=None):
     args = parse_args(argv)
+    if args.save_trajectory and trajectory_cache_hit(args):
+        print("Trajectory generation skipped.")
+        return 0
     device_ids = select_gpus(args.gpu_count, args.gpu_ids)
     args.cuda = torch.cuda.is_available()
     logging = init_experiment(args)
@@ -748,6 +837,7 @@ def run(argv=None):
     log_args(args, logging)
 
     if args.save_trajectory:
+        clear_trajectory_cache(args)
         if args.trajectory_solver == "picard":
             model.func.load_state_dict(torch.load(args.deq_func_load, map_location=device))
             print(f"Loaded Picard trajectory func weights from {args.deq_func_load}")

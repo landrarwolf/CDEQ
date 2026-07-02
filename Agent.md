@@ -29,6 +29,13 @@ Last updated: 2026-07-02.
      - `x_traj`
      - `func_args`
      - `trajectory_solver`
+     - `dataset`
+     - `f_thres`
+     - `max_eval_steps`
+   - `--save-trajectory` skips cached trajectory files when `dataset`,
+     `trajectory_solver`, `f_thres`, and `max_eval_steps` match.
+   - Use `--force-trajectory-regen` to delete and regenerate files under the
+     same `--trajectory-prefix`.
 
 3. Train the consistency model from cached trajectories.
    - Command mode: `--train-CM`.
