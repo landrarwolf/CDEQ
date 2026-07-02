@@ -336,11 +336,22 @@ class ConsistencyFunction(nn.Module):
     def update_func_args(self, func_args):
         self.func_args = func_args
 
-    def forward(self, z1s: torch.Tensor, z1s_1: torch.Tensor, t: torch.Tensor, func_args=None):
+    def forward(self, z1s: torch.Tensor, z1s_1=None, t=None, func_args=None):
         """
         z1s: Current step iteration results [bsz, n_steps, d_model, qlen]
-        z1s_1: Previous iteration results [bsz, n_steps, d_model, qlen]
+        z1s_1: Previous iteration results [bsz, n_steps, d_model, qlen].
+        ponytail: accepts the old forward(z, t, func_args) call until callers are fully cleaned up.
         """
+        if func_args is None and isinstance(t, (list, tuple)):
+            func_args = t
+            t = z1s_1
+            z1s_1 = None
+        elif t is None:
+            t = z1s_1
+            z1s_1 = None
+        if z1s_1 is None:
+            z1s_1 = z1s
+
         if hasattr(self, 'func_args'):
             func_args = self.func_args
         elif not func_args:

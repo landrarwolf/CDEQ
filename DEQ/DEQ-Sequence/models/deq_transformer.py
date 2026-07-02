@@ -217,11 +217,11 @@ class DEQTransformerLM(nn.Module):
 
                 if CM_load is not None:  # CM_load = 'best_CM_model_.pth'
                     T = 5
-                    t = torch.tensor(T).to(dec_inp.device)
-                    self.CD.load_state_dict(torch.load(CM_load))
+                    t = torch.tensor(T).to(dec_inp.device).view(1, 1).expand(bsz, 1)
+                    self.CD.load_state_dict(torch.load(CM_load, map_location=dec_inp.device))
 
                     time_start = time.time()
-                    z1s = self.CD(z1s.unsqueeze(0), t, func_args=func_args).view_as(z1s)
+                    z1s = self.CD(z1s.unsqueeze(1), t, func_args=func_args).squeeze(1)
                     # print(f"Time of CM_solver: {time.time() - time_start}")
 
                     # n_layer = 15

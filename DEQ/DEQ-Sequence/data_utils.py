@@ -241,7 +241,10 @@ def get_lm_corpus(datadir, dataset):
     fn = os.path.join(datadir, 'cache.pt')
     if os.path.exists(fn):
         print('Loading cached dataset...')
-        corpus = torch.load(fn)
+        try:
+            corpus = torch.load(fn, weights_only=False)
+        except TypeError:
+            corpus = torch.load(fn)
     else:
         print('Producing dataset {}...'.format(dataset))
         kwargs = {}

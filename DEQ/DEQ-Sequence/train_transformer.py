@@ -11,6 +11,10 @@ import random
 import subprocess
 import torch
 
+_bootstrap_parser = argparse.ArgumentParser(add_help=False)
+_bootstrap_parser.add_argument('--gpu-count', type=int, default=3)
+_bootstrap_args, _ = _bootstrap_parser.parse_known_args()
+
 
 def get_free_gpu():
     """获取空闲GPU设备号，按照可用内存排序"""
@@ -30,7 +34,7 @@ def get_free_gpu():
         print(f"获取GPU信息失败: {e}")
         return ["0"]  # 默认使用0号GPU
 
-GPU_n = 3
+GPU_n = _bootstrap_args.gpu_count
 # 自动设置可用GPU，选择GPU_n个空闲内存最大的GPU
 available_gpus = get_free_gpu()
 selected_gpus = available_gpus[:GPU_n] if len(available_gpus) >= GPU_n else available_gpus
@@ -39,14 +43,11 @@ print(f"自动选择GPU设备: {os.environ['CUDA_VISIBLE_DEVICES']}")
 torch.cuda.set_device(0)  # 设置主GPU为第一个设备
 
 # 选取GPU_ids为GPU_n个空闲内存最大的GPU
-device_ids = list(range(GPU_n))  # torch.cuda.device_count() - 1
+device_ids = list(range(len(selected_gpus)))  # torch.cuda.device_count() - 1
 
 
 import torch.nn as nn
 import torch.optim as optim
-
-import matplotlib.pyplot as plt
-
 
 sys.path.append('../')
 
@@ -216,6 +217,8 @@ parser.add_argument('--weight_decay', type=float, default=0.0,
                     help='weight decay')
 parser.add_argument('--gpu0_bsz', type=int, default=4,  # 7
                     help='batch size on gpu 0')
+parser.add_argument('--gpu-count', type=int, default=GPU_n,
+                    help='number of free GPUs to select automatically')
 parser.add_argument('--max_eval_steps', type=int, default=-1,
                     help='max eval steps')
 parser.add_argument('--pretrain_steps', type=int, default=0,
@@ -228,6 +231,36 @@ parser.add_argument('--load', type=str, default='pretrained_wt103_deqtrans_v3.pk
                     help='path to load weight')
 parser.add_argument('--name', type=str, default='ljc',
                     help='name of the trial')
+parser.add_argument('--save-trajectory', action='store_true',
+                    help='save DEQ solver trajectories on the validation set and exit')
+parser.add_argument('--trajectory-prefix', type=str, default='traj_all',
+                    help='prefix for saved/loaded trajectory files, e.g. traj_all_1.pt')
+parser.add_argument('--train-CM', '--train-cm', dest='train_CM', action='store_true',
+                    help='train the consistency model before evaluation')
+parser.add_argument('-CM', '--CM', dest='CM', action='store_true',
+                    help='use the trained consistency model during evaluation')
+parser.add_argument('--cm-load', type=str, default='best_CM_model.pth',
+                    help='path to a trained consistency model')
+parser.add_argument('--cm-save', type=str, default='best_CM_model.pth',
+                    help='path to save the best trained consistency model')
+parser.add_argument('--cm-checkpoint', type=str, default='cm_checkpoint/cm_checkpoint.pt',
+                    help='path to save/load CM training checkpoint')
+parser.add_argument('--deq-func-load', type=str, default='./models/pretrained_deq_func.pth',
+                    help='path to the pretrained DEQ function weights for CM training')
+parser.add_argument('--plot-CM', '--plot-cm', dest='plot_CM', action='store_true',
+                    help='plot CM training curves')
+parser.add_argument('--cm-start-file-idx', type=int, default=1,
+                    help='first traj_all_N.pt file index for CM training')
+parser.add_argument('--cm-max-file-idx', type=int, default=3,
+                    help='last traj_all_N.pt file index for CM training')
+parser.add_argument('--cm-max-traj-per-file', type=int, default=15,
+                    help='max trajectories to use from each traj_all_N.pt file')
+parser.add_argument('--cm-num-samples', type=int, default=100,
+                    help='number of trajectories sampled for CM training')
+parser.add_argument('--cm-epochs', type=int, default=50,
+                    help='epochs per sampled trajectory for CM training')
+parser.add_argument('--cm-batch-size', type=int, default=16,
+                    help='batch size for CM trajectory training')
 
 args = parser.parse_args()
 args.tied = not args.not_tied
@@ -449,6 +482,7 @@ def evaluate(eval_iter):
         for i, (data, target, seq_len) in enumerate(eval_iter):  # 90(for val) or 102(for test) sentences
             if 0 < args.max_eval_steps <= i:
                 break
+            rel_diff = None
             t = time.time()
             # data.shape = target.shape = torch.Size([150, 16])
             if save_trajectory:
@@ -464,7 +498,7 @@ def evaluate(eval_iter):
 
                 # 每30个batch保存一次，避免内存溢出，以i/30为文件名
                 if i % 10 == 0 and i != 0:
-                    filename = 'traj_all_' + str(i // 10) + '.pt'
+                    filename = f'{args.trajectory_prefix}_{i // 10}.pt'
                     torch.save(traj_all, filename)
                     print(f"Saved trajectory data!, traj_all_len={len(traj_all)}")
                     traj_all = []
@@ -480,14 +514,18 @@ def evaluate(eval_iter):
                                      spectral_radius_mode=args.spectral_radius_mode, writer=writer,
                                      CM_load = CM_load)
 
-                loss, _, sradius, _, rel_diff, mems = ret[0], ret[1], ret[2], ret[3], ret[4], ret[5:]
+                loss, _, sradius, _, mems = ret[0], ret[1], ret[2], ret[3], ret[4:]
+                rel_diff = None
 
             loss = loss.mean()
             if args.spectral_radius_mode:
                 rho_list.append(sradius.mean().item())
             total_loss += seq_len * loss.float().item()
             total_len += seq_len
-            print(f"i:{i}, Time: {(time.time() - t):.4f}, loss:{loss.float():.4f}, rel_diff:{rel_diff.float():.4f}")  # 0.27s
+            message = f"i:{i}, Time: {(time.time() - t):.4f}, loss:{loss.float():.4f}"
+            if rel_diff is not None:
+                message += f", rel_diff:{rel_diff.float():.4f}"
+            print(message)  # 0.27s
 
 
     if rho_list:
@@ -587,7 +625,7 @@ def CM_train(CM_training):  # 仅针对func in self.f_solver
     CD_ema = nn.DataParallel(CD_ema, device_ids=device_ids, dim=0).to(device)
 
     '''检查是否有断点续训的检查点文件'''
-    checkpoint_path = 'cm_checkpoint/cm_checkpoint.pt'
+    checkpoint_path = args.cm_checkpoint
 
     if os.path.exists(checkpoint_path):
         checkpoint = torch.load(checkpoint_path)
@@ -604,32 +642,35 @@ def CM_train(CM_training):  # 仅针对func in self.f_solver
     # Define global constants
     T = 5  # The maximum time, which is equal to the maximum noise standard deviation
     EPSILON = 0.002  # The minimum time
-    N_EPOCHS = 50  # Number of epochs  default 50
+    N_EPOCHS = args.cm_epochs  # Number of epochs
 
     # 收集所有可用的轨迹
-    max_file_idx = 3
-    max_traj_file = 15
+    max_file_idx = args.cm_max_file_idx
+    max_traj_file = args.cm_max_traj_per_file
     all_trajectories = []
 
     # 首先收集所有可用的轨迹位置信息
-    for file_idx in range(start_file_idx, max_file_idx + 1):
+    for file_idx in range(args.cm_start_file_idx, max_file_idx + 1):
         try:
-            traj_file = torch.load(f'traj_all_{file_idx}.pt', map_location='cpu')
-            print(f"找到文件 traj_all_{file_idx}.pt，共有{len(traj_file)}条轨迹")
+            traj_path = f'{args.trajectory_prefix}_{file_idx}.pt'
+            traj_file = torch.load(traj_path, map_location='cpu')
+            print(f"找到文件 {traj_path}，共有{len(traj_file)}条轨迹")
 
             # 收集该文件中的所有轨迹索引
             for traj_idx in range(min(len(traj_file), max_traj_file)):
                 all_trajectories.append((file_idx, traj_idx))
         except:
-            print(f"无法加载文件 traj_all_{file_idx}.pt")
+            print(f"无法加载文件 {args.trajectory_prefix}_{file_idx}.pt")
 
     print(f"共收集到 {len(all_trajectories)} 条可用轨迹")
+    if not all_trajectories:
+        raise FileNotFoundError("No traj_all_N.pt files found for CM training")
 
     # 设置随机种子以确保可重复性
     random.seed(42)  # 使用固定种子
 
-    # 确保总是采样100条轨迹，即使需要重复采样
-    num_samples = 100
+    # 确保总是采样指定数量轨迹，即使需要重复采样
+    num_samples = args.cm_num_samples
     if len(all_trajectories) >= num_samples:
         # 如果轨迹数量足够，直接随机抽样
         sampled_trajectories = random.sample(all_trajectories, num_samples)
@@ -644,9 +685,9 @@ def CM_train(CM_training):  # 仅针对func in self.f_solver
 
     # 对随机抽取的轨迹进行训练
     for idx, (file_idx, traj_idx) in enumerate(sampled_trajectories):
-        print(f"正在处理第 {idx+1}/{num_samples} 条轨迹，来自文件 traj_all_{file_idx}.pt 中的第 {traj_idx} 条")
+        print(f"正在处理第 {idx+1}/{num_samples} 条轨迹，来自文件 {args.trajectory_prefix}_{file_idx}.pt 中的第 {traj_idx} 条")
 
-        traj = torch.load(f'traj_all_{file_idx}.pt', map_location=device)
+        traj = torch.load(f'{args.trajectory_prefix}_{file_idx}.pt', map_location=device)
         x_list = [traj[i]['x_traj'] for i in range(len(traj))]
         func_args = []
         for i in range(len(traj)):
@@ -665,7 +706,7 @@ def CM_train(CM_training):  # 仅针对func in self.f_solver
         # Create dataset and dataloader
         func_args[2] = func_args[2].unsqueeze(0).expand(bsz, *func_args[2].shape)
         dataset = TensorDataset(x_traj, *func_args)
-        dataloader = DataLoader(dataset, batch_size=16, shuffle=True, drop_last=True,
+        dataloader = DataLoader(dataset, batch_size=args.cm_batch_size, shuffle=True, drop_last=True,
                                 generator=torch.Generator(device=device))
 
         '''Training'''
@@ -675,8 +716,8 @@ def CM_train(CM_training):  # 仅针对func in self.f_solver
                                             N_EPOCHS, T, EPSILON)
 
             # plot the relative error and loss
-            plotting = True
-            if plotting:
+            if args.plot_CM:
+                import matplotlib.pyplot as plt
                 plt.plot(rel_diff_append)
                 plt.plot(loss_append)
                 plt.show()
@@ -690,15 +731,16 @@ def CM_train(CM_training):  # 仅针对func in self.f_solver
                     'params_ema': params_ema,
                     'optimizer': CD_optimizer.state_dict(),
                 }
-                if "cm_checkpoint" not in os.listdir():
-                    os.mkdir('cm_checkpoint')
-                torch.save(checkpoint, f'cm_checkpoint/cm_checkpoint.pt')
+                checkpoint_dir = os.path.dirname(checkpoint_path)
+                if checkpoint_dir:
+                    os.makedirs(checkpoint_dir, exist_ok=True)
+                torch.save(checkpoint, checkpoint_path)
 
             # 更新最佳模型
             if tot_loss < best_loss:
                 best_loss = tot_loss
-                torch.save(CD.module.state_dict(), 'best_CM_model.pth')
-                print(f"新的最佳模型best_CM_model.pth已保存")
+                torch.save(CD.module.state_dict(), args.cm_save)
+                print(f"新的最佳模型{args.cm_save}已保存")
 
         else:
             print("Training skipped. Loading the best model...")
@@ -708,8 +750,7 @@ def CM_train(CM_training):  # 仅针对func in self.f_solver
             x_ini = x_list[0].unsqueeze(1)  # torch.Size([16, 1, 700, 150])
             t = torch.tensor(T).to(device).unsqueeze(0).expand(bsz, -1)  # 直接取最后时间步：T == 5 torch.Size([16, 1])
 
-            # load 'best_CM_model.pth'
-            CD.module.load_state_dict(torch.load('best_CM_model.pth'))
+            CD.module.load_state_dict(torch.load(args.cm_save))
             x = CD(x_ini, t, func_args).squeeze(1)  # torch.Size([16, 700, 150])
             x_rel = x_traj[:,-1]
 
@@ -730,49 +771,23 @@ eval_start_time = time.time()
 train_step = 1e9
 epoch = -1
 
-# 0. 正常验证 DEQ
-# save_trajectory = False
-# CM_mode = False  # 是否使用CM
-# valid_loss = evaluate(va_iter)
-# logging('=' * 100)
-# logging('| End of training | valid loss {:5.2f} | valid ppl {:9.3f}'.format(valid_loss, math.exp(valid_loss)))
-# logging('=' * 100)
+# Command modes replace the old manual comment switches.
+save_trajectory = args.save_trajectory
+CM_mode = args.CM
+CM_load = args.cm_load if args.CM else None
 
-# 1.0 保存1段轨迹 (Note: arg.multi_gpu=False)
-# save_trajectory = True
-# valid_loss = evaluate(va_iter)
-# exit(0)
+if args.save_trajectory:
+    valid_loss = evaluate(va_iter)
+    logging('=' * 100)
+    logging('| End of evaluating on validation set | valid loss {:5.2f} | valid ppl {:9.3f}'.format(
+        valid_loss, math.exp(valid_loss)))
+    logging('=' * 100)
+    print("Trajectory Data Saved!")
+    sys.exit(0)
 
-# 1. get and save Jacobian trajectory (on validation set)
-# save_trajectory = True
-# valid_loss = evaluate(va_iter)
-# logging('=' * 100)
-# logging('| End of evaluating on validation set | valid loss {:5.2f} | valid ppl {:9.3f}'.format(valid_loss, math.exp(valid_loss)))
-# logging('=' * 100)
-# print(f"Trajectory Data Saved!")
-# exit(0)
-
-# save the weights of func
-# model.save_func_weights("./models/")
-
-
-# # 2.1 training a CM if needed, to solve deq_func (on validation set) # todo
-
-deq_func_load = "./models/pretrained_deq_func.pth"
-func_params_dict = torch.load(deq_func_load)
-
-# train a CM
-CM_train(CM_training = True)
-
-# # # 2.2 try Inference
-# CM_train(CM_training = False)
-
-
-
-# 3. Inference with CD_model (on test set) todo CM_mode时，multi-gpu模式有bug，只能单卡？反正推理很快，单卡就单卡吧
-save_trajectory = False  # 已有轨迹和CM，不再保存轨迹
-CM_mode = True  # 是否使用CM
-CM_load = 'best_CM_model.pth'  # a pretrained CM model
+if args.train_CM:
+    func_params_dict = torch.load(args.deq_func_load)
+    CM_train(CM_training=True)
 
 
 valid_loss = evaluate(va_iter)
