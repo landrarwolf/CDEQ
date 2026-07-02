@@ -235,6 +235,8 @@ parser.add_argument('--save-trajectory', action='store_true',
                     help='save DEQ solver trajectories on the validation set and exit')
 parser.add_argument('--trajectory-prefix', type=str, default='traj_all',
                     help='prefix for saved/loaded trajectory files, e.g. traj_all_1.pt')
+parser.add_argument('--trajectory-solver', choices=['anderson', 'picard'], default='anderson',
+                    help='solver used to generate saved trajectories')
 parser.add_argument('--train-CM', '--train-cm', dest='train_CM', action='store_true',
                     help='train the consistency model before evaluation')
 parser.add_argument('-CM', '--CM', dest='CM', action='store_true',
@@ -261,6 +263,8 @@ parser.add_argument('--cm-epochs', type=int, default=50,
                     help='epochs per sampled trajectory for CM training')
 parser.add_argument('--cm-batch-size', type=int, default=16,
                     help='batch size for CM trajectory training')
+parser.add_argument('--cm-train-points', type=int, default=8,
+                    help='trajectory points sampled per CM training batch')
 
 args = parser.parse_args()
 args.tied = not args.not_tied
@@ -500,7 +504,7 @@ def evaluate(eval_iter):
                 ret = para_model(data, target, mems, train_step=train_step, f_thres=args.f_thres,
                                  b_thres=args.b_thres, compute_jac_loss=False,
                                  spectral_radius_mode=args.spectral_radius_mode, writer=writer,
-                                 save_trajectory=save_trajectory)
+                                 save_trajectory=save_trajectory, trajectory_solver=args.trajectory_solver)
 
                 loss, _, sradius, trajectory, mems = ret[0], ret[1], ret[2], ret[3], ret[4:]
 
@@ -562,11 +566,13 @@ def _train_on_trajectory(CD, CD_ema, params_ema, CD_optimizer, dataloader, N_EPO
     with trange(N_EPOCHS) as pbar:
         for epoch in range(N_EPOCHS):
             epoch_loss = 0.0
-            N_steps = 38
+            N_steps = dataloader.dataset.tensors[0].size(1)
+            if N_steps < 2:
+                raise ValueError("Need at least two trajectory points for CM training")
             t_steps = [(EPSILON ** (1 / 7) + (j / (N_steps - 1)) * (T ** (1 / 7) - EPSILON ** (1 / 7))) ** 7
                        for j in range(0, N_steps)]
             # n_steps = int(19 + 19 * epoch / N_EPOCHS)
-            n_steps = 8  # 点太多容易爆显存
+            n_steps = min(args.cm_train_points, N_steps)  # 点太多容易爆显存
 
             # 从N_steps个点中，等距取出n_steps个点
             indices = torch.linspace(1, N_steps - 1, steps=n_steps).round().long().tolist()
@@ -586,14 +592,18 @@ def _train_on_trajectory(CD, CD_ema, params_ema, CD_optimizer, dataloader, N_EPO
 
                 x_tn_1 = x_batch[:,n_1]
                 x_tn = x_batch[:,(np.array(n_1) - 1).tolist()]
+                x_tn_prev = x_batch[:,np.maximum(np.array(n_1) - 2, 0).tolist()]
 
                 # 计算损失
                 with torch.no_grad():
-                    out_tn = CD_ema(x_tn, tn.unsqueeze(0).expand(x_tn.size(0), -1), current_func_args)
-                loss_1 = F.mse_loss(CD(x_tn_1, tn_1.unsqueeze(0).expand(x_tn.size(0), -1), current_func_args), out_tn)
+                    out_tn = CD_ema(x_tn, x_tn_prev, tn.unsqueeze(0).expand(x_tn.size(0), -1), current_func_args)
+                loss_1 = F.mse_loss(
+                    CD(x_tn_1, x_tn, tn_1.unsqueeze(0).expand(x_tn.size(0), -1), current_func_args),
+                    out_tn,
+                )
 
                 x_fixed = x_batch[:,-1].unsqueeze(1).expand(-1, n_steps, -1, -1)
-                loss_2_x = CD(x_tn, tn.unsqueeze(0).expand(x_tn.size(0), -1), current_func_args)
+                loss_2_x = CD(x_tn, x_tn_prev, tn.unsqueeze(0).expand(x_tn.size(0), -1), current_func_args)
                 loss_2 = F.smooth_l1_loss(loss_2_x, x_fixed)  # F.mse_loss: loss_2_x 和 x_fixed 这两个张量之间的均方误差
                 loss = 0.1 * loss_1 + 0.9 * loss_2
 
@@ -612,7 +622,7 @@ def _train_on_trajectory(CD, CD_ema, params_ema, CD_optimizer, dataloader, N_EPO
                 with torch.no_grad():
                     x_ini = x_batch[:,0:1]
                     T = t_steps[-1] if isinstance(t_steps[-1], torch.Tensor) else torch.tensor(t_steps[-1], device=x_batch.device)
-                    x1 = CD_ema(x_ini, T.unsqueeze(0).expand(batch_size, -1), current_func_args)
+                    x1 = CD_ema(x_ini, x_ini, T.unsqueeze(0).expand(batch_size, -1), current_func_args)
                     rel_diff = (x1 - x_batch[:, -1:]).norm() / x_batch[:,-1:].norm()
                     rel_diff_append.append(rel_diff.item())
                     loss_append.append(loss.item())
@@ -771,7 +781,7 @@ def CM_train(CM_training):  # 仅针对func in self.f_solver
             t = torch.tensor(T).to(device).unsqueeze(0).expand(bsz, -1)  # 直接取最后时间步：T == 5 torch.Size([16, 1])
 
             CD.module.load_state_dict(torch.load(args.cm_save))
-            x = CD(x_ini, t, func_args).squeeze(1)  # torch.Size([16, 700, 150])
+            x = CD(x_ini, x_ini, t, func_args).squeeze(1)  # torch.Size([16, 700, 150])
             x_rel = x_traj[:,-1]
 
             rel_diff = (x - x_rel).norm() / x_rel.norm()  # relative error
@@ -797,6 +807,9 @@ CM_mode = args.CM
 CM_load = args.cm_load if args.CM else None
 
 if args.save_trajectory:
+    if args.trajectory_solver == 'picard':
+        model.func.load_state_dict(torch.load(args.deq_func_load))
+        print(f"Loaded Picard trajectory func weights from {args.deq_func_load}")
     valid_loss = evaluate(va_iter)
     logging('=' * 100)
     logging('| End of evaluating on validation set | valid loss {:5.2f} | valid ppl {:9.3f}'.format(

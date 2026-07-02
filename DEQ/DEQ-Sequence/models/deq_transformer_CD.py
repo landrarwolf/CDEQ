@@ -340,17 +340,9 @@ class ConsistencyFunction(nn.Module):
         """
         z1s: Current step iteration results [bsz, n_steps, d_model, qlen]
         z1s_1: Previous iteration results [bsz, n_steps, d_model, qlen].
-        ponytail: accepts the old forward(z, t, func_args) call until callers are fully cleaned up.
         """
-        if func_args is None and isinstance(t, (list, tuple)):
-            func_args = t
-            t = z1s_1
-            z1s_1 = None
-        elif t is None:
-            t = z1s_1
-            z1s_1 = None
-        if z1s_1 is None:
-            z1s_1 = z1s
+        if z1s_1 is None or t is None or not torch.is_tensor(z1s_1) or not torch.is_tensor(t):
+            raise ValueError("ConsistencyFunction.forward requires forward(z, z_prev, t, func_args)")
 
         if hasattr(self, 'func_args'):
             func_args = self.func_args

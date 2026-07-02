@@ -146,7 +146,8 @@ class DEQTransformerLM(nn.Module):
             return [new_z0, new_u0]
 
     def _forward(self, dec_inp, mems=None, f_thres=30, b_thres=40, train_step=-1,
-                 compute_jac_loss=True, spectral_radius_mode=False, writer=None, save_trajectory=False, CM_load=None):
+                 compute_jac_loss=True, spectral_radius_mode=False, writer=None, save_trajectory=False,
+                 trajectory_solver='anderson', CM_load=None):
         """
         Apply the DEQ-Transformer language model on input word tokens
 
@@ -201,12 +202,19 @@ class DEQTransformerLM(nn.Module):
                 # 有效的input仅为mems=[us, z0]
                 # output: result['result'], result['X_list']
                 time_start = time.time()
-                result = self.f_solver(lambda z: self.func(z, *func_args), z1s, threshold=f_thres,
-                                       stop_mode=self.stop_mode)
-                # print(f"Time of anderson_solver: {time.time() - time_start}")
-                new_z1s = result['result']  # torch.Size([16, 700, 150])
+                if save_trajectory and trajectory_solver == 'picard':
+                    X_list = []
+                    for _ in range(f_thres):
+                        z1s = self.func(z1s, *func_args)
+                        X_list.append(z1s.clone().detach())
+                    new_z1s = z1s
+                else:
+                    result = self.f_solver(lambda z: self.func(z, *func_args), z1s, threshold=f_thres,
+                                           stop_mode=self.stop_mode)
+                    # print(f"Time of anderson_solver: {time.time() - time_start}")
+                    new_z1s = result['result']  # torch.Size([16, 700, 150])
+                    X_list = result.get('X_list', [])
                 if save_trajectory:
-                    X_list = result['X_list']
                     x_traj = torch.stack(X_list, dim=0)  # 列表堆叠成矩阵
                     # Save x_traj_stqueezed, us, z0,
                     # posputting as a list and name it trajectory
@@ -221,14 +229,13 @@ class DEQTransformerLM(nn.Module):
                     self.CD.load_state_dict(torch.load(CM_load, map_location=dec_inp.device))
 
                     time_start = time.time()
-                    z1s = self.CD(z1s.unsqueeze(1), t, func_args=func_args).squeeze(1)
+                    z1s_step = z1s.unsqueeze(1)
+                    z1s = self.CD(z1s_step, z1s_step, t, func_args=func_args).squeeze(1)
                     # print(f"Time of CM_solver: {time.time() - time_start}")
 
                     # n_layer = 15
                     # for i in range(n_layer):
                     #     z1s = self.func(z1s, *func_args)
-                        # z1s = self.CD(z1s.unsqueeze(0), t, func_args=func_args).view_as(z1s)
-
                     # z1s = self.f_solver(lambda z: self.func(z, *func_args), z1s, threshold=f_thres,
                     #                     stop_mode=self.stop_mode)['result']
 
@@ -289,6 +296,7 @@ class DEQTransformerLM(nn.Module):
         sradius_mode = kwargs.get('spectral_radius_mode', False)
         writer = kwargs.get('writer', None)
         save_trajectory = kwargs.get('save_trajectory', False)
+        trajectory_solver = kwargs.get('trajectory_solver', 'anderson')
         CM_load = kwargs.get('CM_load', None)
         hidden, new_mems, jac_loss, sradius, trajectory = self._forward(data, mems=mems, f_thres=f_thres, b_thres=b_thres,
                                                             train_step=train_step,
@@ -296,6 +304,7 @@ class DEQTransformerLM(nn.Module):
                                                             spectral_radius_mode=sradius_mode,
                                                             writer=writer,
                                                             save_trajectory=save_trajectory,
+                                                            trajectory_solver=trajectory_solver,
                                                             CM_load=CM_load,
                                                             )
         pred_hid = hidden[-tgt_len:]
