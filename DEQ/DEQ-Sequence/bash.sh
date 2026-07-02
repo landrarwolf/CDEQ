@@ -1,1 +1,0 @@
-bash wt103_deq_transformer.sh train --cuda --multi_gpu --f_solver broyden --f_thres 30 --b_thres 40
