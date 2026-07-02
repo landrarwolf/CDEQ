@@ -471,6 +471,17 @@ def evaluate(eval_iter):
     model.eval()
     model.reset_length(args.eval_tgt_len, args.mem_len)
 
+    def _to_cpu(obj):
+        if torch.is_tensor(obj):
+            return obj.detach().cpu()
+        if isinstance(obj, list):
+            return [_to_cpu(item) for item in obj]
+        if isinstance(obj, tuple):
+            return tuple(_to_cpu(item) for item in obj)
+        if isinstance(obj, dict):
+            return {key: _to_cpu(value) for key, value in obj.items()}
+        return obj
+
     # Evaluation
     total_len, total_loss = 0, 0.
     rho_list = []
@@ -494,7 +505,8 @@ def evaluate(eval_iter):
                 loss, _, sradius, trajectory, mems = ret[0], ret[1], ret[2], ret[3], ret[4:]
 
                 # 将trajectory堆叠到一个张量traj中
-                traj_all.append(trajectory)
+                traj_all.append(_to_cpu(trajectory))
+                del trajectory
 
                 # 每30个batch保存一次，避免内存溢出，以i/30为文件名
                 if i % 10 == 0 and i != 0:
@@ -502,6 +514,8 @@ def evaluate(eval_iter):
                     torch.save(traj_all, filename)
                     print(f"Saved trajectory data!, traj_all_len={len(traj_all)}")
                     traj_all = []
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
             else:  # 推理模式
                 if CM_mode is False:  # 原始DEQ
@@ -526,6 +540,8 @@ def evaluate(eval_iter):
             if rel_diff is not None:
                 message += f", rel_diff:{rel_diff.float():.4f}"
             print(message)  # 0.27s
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         if save_trajectory and traj_all:
             filename = f'{args.trajectory_prefix}_{i // 10 + 1}.pt'
