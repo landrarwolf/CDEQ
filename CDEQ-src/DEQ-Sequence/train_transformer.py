@@ -167,6 +167,8 @@ def build_parser():
                         help="batch size on GPU 0")
     parser.add_argument("--gpu-count", type=int, default=3,
                         help="number of free GPUs to select automatically")
+    parser.add_argument("--gpu-ids", type=str, default="",
+                        help="comma-separated physical GPU ids to consider; empty means all")
     parser.add_argument("--max_eval_steps", type=int, default=-1,
                         help="max eval batches; <=0 means all")
     parser.add_argument("--pretrain_steps", type=int, default=0,
@@ -241,7 +243,21 @@ def parse_args(argv=None):
     return args
 
 
-def get_free_gpus():
+def parse_gpu_ids(gpu_ids):
+    if not gpu_ids:
+        return None
+    ids = []
+    for raw_id in gpu_ids.split(","):
+        gpu_id = raw_id.strip()
+        if not gpu_id:
+            continue
+        if not gpu_id.isdigit():
+            raise ValueError(f"Invalid GPU id: {gpu_id}")
+        ids.append(gpu_id)
+    return ids or None
+
+
+def get_free_gpus(allowed_gpu_ids=None):
     try:
         output = subprocess.check_output(
             ["nvidia-smi", "--query-gpu=memory.free,index", "--format=csv,nounits,noheader"],
@@ -254,13 +270,19 @@ def get_free_gpus():
     gpus = []
     for line in output.strip().splitlines():
         free_mem, index = line.split(",")
+        index = index.strip()
+        if allowed_gpu_ids is not None and index not in allowed_gpu_ids:
+            continue
         gpus.append((int(free_mem), int(index)))
     gpus.sort(reverse=True)
     return [str(index) for _, index in gpus]
 
 
-def select_gpus(gpu_count):
-    available = get_free_gpus()
+def select_gpus(gpu_count, gpu_ids=""):
+    allowed_gpu_ids = parse_gpu_ids(gpu_ids)
+    available = get_free_gpus(allowed_gpu_ids)
+    if allowed_gpu_ids and not available:
+        raise RuntimeError(f"No requested GPUs are available: {','.join(allowed_gpu_ids)}")
     selected = available[:gpu_count] if gpu_count > 0 else []
     if selected:
         print(f"自动选择GPU设备: {','.join(selected)}")
@@ -716,7 +738,7 @@ def log_valid_loss(logging, label, valid_loss):
 
 def run(argv=None):
     args = parse_args(argv)
-    device_ids = select_gpus(args.gpu_count)
+    device_ids = select_gpus(args.gpu_count, args.gpu_ids)
     args.cuda = torch.cuda.is_available()
     logging = init_experiment(args)
     set_seed(args)
