@@ -11,7 +11,8 @@ Old forked scripts were removed. Use command flags instead of editing comments
 inside the code.
 
 CDEQ trajectory generation, CM training, and CM inference must use the same
-`--trajectory-solver`. Only `picard` and `anderson` are supported here.
+`--trajectory-solver`. The default is `picard`; `anderson` is only for explicit
+solver experiments.
 The legacy Broyden solver is intentionally not exposed in this maintained path.
 
 ## Required Local Artifacts
@@ -42,7 +43,6 @@ python train_transformer.py \
   --debug \
   --gpu-count 1 \
   --save-trajectory \
-  --trajectory-solver picard \
   --deq-func-load ./models/pretrained_deq_func.pth \
   --trajectory-prefix traj_all \
   --f_thres 40
@@ -55,7 +55,6 @@ python train_transformer.py \
   --debug \
   --gpu-count 1 \
   --train-CM \
-  --trajectory-solver picard \
   --trajectory-prefix traj_all \
   --cm-start-file-idx 1 \
   --cm-max-file-idx 9 \
@@ -70,7 +69,6 @@ python train_transformer.py \
   --debug \
   --gpu-count 1 \
   -CM \
-  --trajectory-solver picard \
   --cm-load best_CM_model.pth \
   --max_eval_steps 1
 ```
@@ -81,16 +79,16 @@ For a fast implementation check, use a temporary prefix and tiny limits:
 
 ```sh
 python train_transformer.py --debug --gpu-count 1 --save-trajectory \
-  --trajectory-solver picard --trajectory-prefix /tmp/cdeq_refactor_smoke \
+  --trajectory-prefix /tmp/cdeq_refactor_smoke \
   --deq-func-load ./models/pretrained_deq_func.pth --f_thres 4 --max_eval_steps 1
 
 python train_transformer.py --debug --gpu-count 1 --train-CM \
-  --trajectory-solver picard --trajectory-prefix /tmp/cdeq_refactor_smoke --cm-start-file-idx 1 \
+  --trajectory-prefix /tmp/cdeq_refactor_smoke --cm-start-file-idx 1 \
   --cm-max-file-idx 1 --cm-max-traj-per-file 1 --cm-num-samples 1 \
   --cm-epochs 1 --cm-batch-size 1 --cm-train-points 4 \
   --cm-save /tmp/cdeq_refactor_cm_smoke.pth \
   --cm-checkpoint /tmp/cdeq_refactor_cm_smoke.pt --max_eval_steps 1
 
 python train_transformer.py --debug --gpu-count 1 -CM \
-  --trajectory-solver picard --cm-load /tmp/cdeq_refactor_cm_smoke.pth --max_eval_steps 1
+  --cm-load /tmp/cdeq_refactor_cm_smoke.pth --max_eval_steps 1
 ```

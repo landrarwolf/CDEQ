@@ -147,7 +147,7 @@ class DEQTransformerLM(nn.Module):
 
     def _forward(self, dec_inp, mems=None, f_thres=30, b_thres=40, train_step=-1,
                  compute_jac_loss=True, spectral_radius_mode=False, writer=None, save_trajectory=False,
-                 trajectory_solver='anderson', CM_load=None, CM_solver='anderson'):
+                 trajectory_solver='picard', CM_load=None, CM_solver='picard'):
         """
         Apply the DEQ-Transformer language model on input word tokens
 
@@ -298,7 +298,7 @@ class DEQTransformerLM(nn.Module):
         sradius_mode = kwargs.get('spectral_radius_mode', False)
         writer = kwargs.get('writer', None)
         save_trajectory = kwargs.get('save_trajectory', False)
-        trajectory_solver = kwargs.get('trajectory_solver', 'anderson')
+        trajectory_solver = kwargs.get('trajectory_solver', 'picard')
         CM_load = kwargs.get('CM_load', None)
         CM_solver = kwargs.get('CM_solver', trajectory_solver)
         hidden, new_mems, jac_loss, sradius, trajectory = self._forward(data, mems=mems, f_thres=f_thres, b_thres=b_thres,

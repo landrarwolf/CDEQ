@@ -313,7 +313,7 @@ def anderson_step(z_curr, z_prev, f_curr, f_prev, beta=1.0):
 
 
 class ConsistencyFunction(nn.Module):
-    def __init__(self, n_head, d_model, d_head, d_inner, dropout, n_layer, func_args=None, solver='anderson'):
+    def __init__(self, n_head, d_model, d_head, d_inner, dropout, n_layer, func_args=None, solver='picard'):
         super().__init__()
         if func_args is not None:
             self.update_func_args(func_args)

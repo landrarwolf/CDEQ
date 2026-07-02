@@ -183,7 +183,7 @@ def build_parser():
                         help="save DEQ solver trajectories and exit")
     parser.add_argument("--trajectory-prefix", type=str, default="traj_all",
                         help="prefix for saved/loaded trajectory files")
-    parser.add_argument("--trajectory-solver", choices=["anderson", "picard"], default="anderson",
+    parser.add_argument("--trajectory-solver", choices=["picard", "anderson"], default="picard",
                         help="solver used for saved trajectories and CM training/inference")
     parser.add_argument("--train-CM", "--train-cm", dest="train_CM", action="store_true",
                         help="train the consistency model")
