@@ -41,8 +41,8 @@ class ConsistencyFunction(nn.Module):
             outputs = self.mlp(inputs)
 
             return (
-                    ((T - t) / (T - EPSILON)).view(-1, 1, 1) * x
-                    + ((t - EPSILON) / (T - EPSILON)).view(-1, 1, 1) * outputs
+                    ((T - t) / T).view(-1, 1, 1) * outputs
+                    + (t / T).view(-1, 1, 1) * x
             )
 
         # len(x.shape) == 2
@@ -52,4 +52,4 @@ class ConsistencyFunction(nn.Module):
         #     inputs = torch.cat([x, t.unsqueeze(-1)], dim=-1)
         #     outputs = F.relu(self.gc(inputs, self.adj))
         #
-        #     return ((T - t) / (T - EPSILON)).unsqueeze(-1) * x + ((t - EPSILON) / (T - EPSILON)).unsqueeze(-1) * outputs
+        #     return ((T - t) / T).unsqueeze(-1) * outputs + (t / T).unsqueeze(-1) * x

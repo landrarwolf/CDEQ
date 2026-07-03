@@ -20,6 +20,15 @@ from utils.proj_adaptive_softmax import ProjectedAdaptiveLogSoftmax
 from utils.log_uniform_sampler import LogUniformSampler, sample_logits
 
 
+def cm_boundary_mix(z1s, outputs, t, T=5):
+    bsz, n_steps = z1s.shape[0], z1s.shape[1]
+    return (
+            ((T - t) / T).view(bsz, n_steps, 1, 1) * outputs
+            +
+            (t / T).view(bsz, n_steps, 1, 1) * z1s
+    )
+
+
 class WeightSharePositionwiseFF(nn.Module):
     def __init__(self, d_model, d_inner, dropout, pre_lnorm=False):
         super(WeightSharePositionwiseFF, self).__init__()
@@ -267,12 +276,10 @@ class RelPartialLearnableDecoderLayer(nn.Module):
 #         outputs = self.embedding(input_t.permute(0, 1, 3, 2)).permute(0, 1, 3, 2).contiguous()
 #
 #         T = 5
-#         EPSILON = 0.002
-#
 #         result = (
-#                 ((T - t) / (T - EPSILON)).view(bsz, n_steps, 1, 1) * z1s  # 原为inputs
+#                 ((T - t) / T).view(bsz, n_steps, 1, 1) * outputs
 #                 +
-#                 ((t - EPSILON) / (T - EPSILON)).view(bsz, n_steps, 1, 1) * outputs
+#                 (t / T).view(bsz, n_steps, 1, 1) * z1s
 #                 )
 #
 #         return result
@@ -383,12 +390,7 @@ class ConsistencyFunction(nn.Module):
         outputs = self.embedding(input_t.permute(0, 1, 3, 2)).permute(0, 1, 3, 2).contiguous()
 
         T = 5
-        EPSILON = 0.002
 
-        result = (
-                ((T - t) / (T - EPSILON)).view(bsz, n_steps, 1, 1) * z1s
-                +
-                ((t - EPSILON) / (T - EPSILON)).view(bsz, n_steps, 1, 1) * outputs
-        )
+        result = cm_boundary_mix(z1s, outputs, t, T=T)
 
         return result

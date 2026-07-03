@@ -123,7 +123,13 @@ class DEQTransformerLM(nn.Module):
     def load_cm_weights(self, path, device):
         key = (path, str(device))
         if key not in self._cm_state_cache:
-            self._cm_state_cache[key] = torch.load(path, map_location=device)
+            state = torch.load(path, map_location=device)
+            if not isinstance(state, dict) or state.get('cm_time_convention') != 'z0_eps_to_fixed_T_v1':
+                raise ValueError(
+                    f"CM weights {path} do not match z0_eps_to_fixed_T_v1. "
+                    "Retrain the CM before running -CM inference."
+                )
+            self._cm_state_cache[key] = state['model']
         self.CD.load_state_dict(self._cm_state_cache[key])
 
     def init_mems(self):
@@ -211,9 +217,10 @@ class DEQTransformerLM(nn.Module):
                 time_start = time.time()
                 run_teacher_solver = save_trajectory or CM_load is None or CM_compare_teacher
                 use_picard_teacher = trajectory_solver == 'picard' and (save_trajectory or CM_compare_teacher)
+                initial_z1s = z1s.clone().detach()
                 X_list = []
                 if run_teacher_solver and use_picard_teacher:
-                    X_list = []
+                    X_list = [initial_z1s]
                     for _ in range(f_thres):
                         z1s = self.func(z1s, *func_args)
                         X_list.append(z1s.clone().detach())
@@ -223,22 +230,33 @@ class DEQTransformerLM(nn.Module):
                                            stop_mode=self.stop_mode)
                     # print(f"Time of anderson_solver: {time.time() - time_start}")
                     new_z1s = result['result']  # torch.Size([16, 700, 150])
-                    X_list = result.get('X_list', [])
+                    X_list = [initial_z1s] + result.get('X_list', [])
+                    if not torch.equal(X_list[-1], new_z1s):
+                        X_list.append(new_z1s.clone().detach())
                 else:
                     new_z1s = z1s
                 if save_trajectory:
-                    x_traj = torch.stack(X_list, dim=0)  # 列表堆叠成矩阵
+                    x_traj = torch.stack(X_list, dim=0)  # z=0 -> fixed-point approximation
+                    T, EPSILON = 5, 0.002
+                    if len(X_list) == 1:
+                        t_traj = torch.tensor([EPSILON], dtype=x_traj.dtype, device=x_traj.device)
+                    else:
+                        t_traj = torch.tensor([
+                            (EPSILON ** (1 / 7) + (j / (len(X_list) - 1)) * (T ** (1 / 7) - EPSILON ** (1 / 7))) ** 7
+                            for j in range(len(X_list))
+                        ], dtype=x_traj.dtype, device=x_traj.device)
                     # Save x_traj_stqueezed, us, z0,
                     # posputting as a list and name it trajectory
                     trajectory = {
                         'x_traj': x_traj,  # x_traj.shape = torch.Size([39, 2, 700, 150])
+                        't_traj': t_traj,  # EPSILON -> T, aligned with x_traj
                         'func_args': func_args,  # func_args = [us, z0, pos_emb]
                         'trajectory_solver': trajectory_solver,
+                        'trajectory_format': 'z0_eps_to_fixed_T_v1',
                     }
 
                 if CM_load is not None:  # CM_load = 'best_CM_model_.pth'
-                    T = 5
-                    t = torch.tensor(T).to(dec_inp.device).view(1, 1).expand(bsz, 1)
+                    t = torch.zeros(1, 1, device=dec_inp.device).expand(bsz, 1)
                     self.CD.set_solver(CM_solver)
                     self.load_cm_weights(CM_load, dec_inp.device)
 

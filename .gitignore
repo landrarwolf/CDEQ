@@ -1,4 +1,5 @@
 .DS_Store
+私钥.txt
 **/__pycache__/
 *.py[cod]
 

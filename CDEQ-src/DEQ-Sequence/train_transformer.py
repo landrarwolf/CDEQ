@@ -33,6 +33,8 @@ SOLVERS = {
     "anderson": anderson,
 }
 
+TRAJECTORY_FORMAT_VERSION = "z0_eps_to_fixed_T_v1"
+
 
 def build_parser():
     parser = argparse.ArgumentParser(description="PyTorch DEQ Sequence Model")
@@ -454,6 +456,7 @@ def find_trajectory_files(prefix):
 def trajectory_cache_expected(args):
     return {
         "dataset": args.dataset,
+        "trajectory_format": TRAJECTORY_FORMAT_VERSION,
         "trajectory_solver": args.trajectory_solver,
         "f_thres": args.f_thres,
         "max_eval_steps": args.max_eval_steps,
@@ -599,7 +602,30 @@ def module_of(model):
     return model.module if hasattr(model, "module") else model
 
 
-def train_on_trajectory(args, cd, cd_ema, params_ema, optimizer, dataloader, n_epochs, max_t, epsilon):
+def save_cm_package(path, cd):
+    save_dir = os.path.dirname(path)
+    if save_dir:
+        os.makedirs(save_dir, exist_ok=True)
+    torch.save(
+        {
+            "cm_time_convention": TRAJECTORY_FORMAT_VERSION,
+            "model": module_of(cd).state_dict(),
+        },
+        path,
+    )
+
+
+def load_cm_package(path, device):
+    state = torch.load(path, map_location=device)
+    if not isinstance(state, dict) or state.get("cm_time_convention") != TRAJECTORY_FORMAT_VERSION:
+        raise ValueError(
+            f"CM weights {path} do not match {TRAJECTORY_FORMAT_VERSION}. "
+            "Retrain the CM before using these weights."
+        )
+    return state["model"]
+
+
+def train_on_trajectory(args, cd, cd_ema, params_ema, optimizer, dataloader, t_traj, n_epochs, best_rel_diff):
     rel_diff_append = []
     loss_append = []
     tot_loss = 0.0
@@ -610,22 +636,21 @@ def train_on_trajectory(args, cd, cd_ema, params_ema, optimizer, dataloader, n_e
             n_total_steps = dataloader.dataset.tensors[0].size(1)
             if n_total_steps < 2:
                 raise ValueError("Need at least two trajectory points for CM training")
-            t_steps = [
-                (epsilon ** (1 / 7) + (j / (n_total_steps - 1)) * (max_t ** (1 / 7) - epsilon ** (1 / 7))) ** 7
-                for j in range(n_total_steps)
-            ]
+            if t_traj.numel() != n_total_steps:
+                raise ValueError(f"t_traj has {t_traj.numel()} points, but x_traj has {n_total_steps}")
             n_steps = min(args.cm_train_points, n_total_steps)
             indices = torch.linspace(1, n_total_steps - 1, steps=n_steps).round().long().tolist()
             n_1 = [indices[random.randint(0, len(indices) - 1)] for _ in range(n_steps)]
-            rel_diff = torch.tensor(0.0)
+            epoch_rel_diffs = []
 
             for data in dataloader:
                 x_batch = data[0]
                 batch_size = x_batch.size(0)
                 current_func_args = data[1:]
+                batch_t_traj = t_traj.to(x_batch.device)
 
-                tn_1 = torch.tensor([t_steps[i] for i in n_1]).to(x_batch.device)
-                tn = torch.tensor([t_steps[i - 1] for i in n_1]).to(x_batch.device)
+                tn_1 = batch_t_traj[n_1]
+                tn = batch_t_traj[(np.array(n_1) - 1).tolist()]
                 x_tn_1 = x_batch[:, n_1]
                 x_tn = x_batch[:, (np.array(n_1) - 1).tolist()]
                 x_tn_prev = x_batch[:, np.maximum(np.array(n_1) - 2, 0).tolist()]
@@ -636,9 +661,9 @@ def train_on_trajectory(args, cd, cd_ema, params_ema, optimizer, dataloader, n_e
                     cd(x_tn_1, x_tn, tn_1.unsqueeze(0).expand(x_tn.size(0), -1), current_func_args),
                     out_tn,
                 )
-                x_fixed = x_batch[:, -1].unsqueeze(1).expand(-1, n_steps, -1, -1)
+                x_endpoint = x_batch[:, -1].unsqueeze(1).expand(-1, n_steps, -1, -1)
                 loss_2_x = cd(x_tn, x_tn_prev, tn.unsqueeze(0).expand(x_tn.size(0), -1), current_func_args)
-                loss_2 = F.smooth_l1_loss(loss_2_x, x_fixed)
+                loss_2 = F.smooth_l1_loss(loss_2_x, x_endpoint)
                 loss = 0.1 * loss_1 + 0.9 * loss_2
 
                 loss.backward()
@@ -652,19 +677,32 @@ def train_on_trajectory(args, cd, cd_ema, params_ema, optimizer, dataloader, n_e
                 module_of(cd_ema).load_state_dict(params_ema)
                 epoch_loss += loss.item()
 
+                was_training = cd.training
+                cd.eval()
                 with torch.no_grad():
                     x_ini = x_batch[:, 0:1]
-                    t_final = torch.tensor(t_steps[-1], device=x_batch.device)
-                    x1 = cd_ema(x_ini, x_ini, t_final.unsqueeze(0).expand(batch_size, -1), current_func_args)
+                    t0 = torch.zeros(1, device=x_batch.device)
+                    x1 = cd(x_ini, x_ini, t0.expand(batch_size, -1), current_func_args)
                     rel_diff = (x1 - x_batch[:, -1:]).norm() / x_batch[:, -1:].norm()
                     rel_diff_append.append(rel_diff.item())
+                    epoch_rel_diffs.append(rel_diff.item())
                     loss_append.append(loss.item())
+                if was_training:
+                    cd.train()
 
             tot_loss = epoch_loss / len(dataloader)
-            pbar.set_postfix(epoch=epoch, loss=tot_loss, rel_diff=rel_diff.item())
+            epoch_rel_diff = sum(epoch_rel_diffs) / len(epoch_rel_diffs)
+            if epoch_rel_diff < best_rel_diff:
+                best_rel_diff = epoch_rel_diff
+                save_cm_package(args.cm_save, cd)
+            print(
+                f"CM epoch {epoch + 1}/{n_epochs}: "
+                f"loss={tot_loss:.6f}, rel_diff={epoch_rel_diff:.6f}, best_rel_diff={best_rel_diff:.6f}"
+            )
+            pbar.set_postfix(epoch=epoch + 1, loss=tot_loss, rel_diff=epoch_rel_diff, best=best_rel_diff)
             pbar.update()
 
-    return tot_loss, rel_diff_append, loss_append, params_ema
+    return tot_loss, rel_diff_append, loss_append, params_ema, best_rel_diff
 
 
 def train_consistency_model(args, device, device_ids, func_params_dict):
@@ -699,6 +737,11 @@ def train_consistency_model(args, device, device_ids, func_params_dict):
 
     if os.path.exists(args.cm_checkpoint):
         checkpoint = torch.load(args.cm_checkpoint, map_location=device)
+        if checkpoint.get("cm_time_convention") != TRAJECTORY_FORMAT_VERSION:
+            raise ValueError(
+                f"CM checkpoint {args.cm_checkpoint} does not match {TRAJECTORY_FORMAT_VERSION}. "
+                "Use a fresh --cm-checkpoint path or delete the old checkpoint."
+            )
         module_of(cd).load_state_dict(checkpoint["model"])
         module_of(cd_ema).load_state_dict(checkpoint["model_ema"])
         params_ema = checkpoint["params_ema"]
@@ -730,12 +773,18 @@ def train_consistency_model(args, device, device_ids, func_params_dict):
         sampled_trajectories = [random.choice(all_trajectories) for _ in range(args.cm_num_samples)]
     print(f"随机抽取了 {args.cm_num_samples} 条轨迹进行训练（可能包含重复轨迹）")
 
-    best_loss = 1e9
-    max_t, epsilon = 5, 0.002
+    best_rel_diff = float("inf")
     for idx, (file_idx, traj_idx) in enumerate(sampled_trajectories):
         print(f"正在处理第 {idx + 1}/{args.cm_num_samples} 条轨迹，来自文件 {args.trajectory_prefix}_{file_idx}.pt 中的第 {traj_idx} 条")
         traj = torch.load(f"{args.trajectory_prefix}_{file_idx}.pt", map_location=device)
         item = traj[traj_idx]
+        saved_format = item.get("trajectory_format")
+        if saved_format != TRAJECTORY_FORMAT_VERSION:
+            raise ValueError(
+                f"Trajectory format mismatch: file uses {saved_format}, "
+                f"but this code requires {TRAJECTORY_FORMAT_VERSION}. "
+                "Regenerate trajectories with --force-trajectory-regen."
+            )
         saved_solver = item.get("trajectory_solver")
         if saved_solver is not None and saved_solver != args.trajectory_solver:
             raise ValueError(
@@ -753,6 +802,9 @@ def train_consistency_model(args, device, device_ids, func_params_dict):
         if saved_dataset is None:
             print(f"轨迹未记录dataset，按 --dataset={args.dataset} 处理")
         x_list = item["x_traj"]
+        t_traj = item.get("t_traj")
+        if t_traj is None:
+            raise ValueError("Trajectory is missing t_traj. Regenerate trajectories with --force-trajectory-regen.")
         func_args = [item["func_args"][0], item["func_args"][1], item["func_args"][2]]
         x_traj = x_list.permute(1, 0, 2, 3)
         bsz = x_traj.shape[0]
@@ -767,16 +819,16 @@ def train_consistency_model(args, device, device_ids, func_params_dict):
             generator=torch.Generator(device=device),
         )
 
-        tot_loss, rel_diff_append, loss_append, params_ema = train_on_trajectory(
+        tot_loss, rel_diff_append, loss_append, params_ema, best_rel_diff = train_on_trajectory(
             args,
             cd,
             cd_ema,
             params_ema,
             optimizer,
             dataloader,
+            t_traj,
             args.cm_epochs,
-            max_t,
-            epsilon,
+            best_rel_diff,
         )
         if args.plot_CM:
             import matplotlib.pyplot as plt
@@ -793,18 +845,14 @@ def train_consistency_model(args, device, device_ids, func_params_dict):
                 "model_ema": module_of(cd_ema).state_dict(),
                 "params_ema": params_ema,
                 "optimizer": optimizer.state_dict(),
+                "cm_time_convention": TRAJECTORY_FORMAT_VERSION,
             },
             args.cm_checkpoint,
         )
-        if tot_loss < best_loss:
-            best_loss = tot_loss
-            torch.save(module_of(cd).state_dict(), args.cm_save)
-            print(f"新的最佳模型{args.cm_save}已保存")
-
         with torch.no_grad():
             x_ini = x_list[0].unsqueeze(1)
-            t = torch.tensor(max_t).to(device).unsqueeze(0).expand(bsz, -1)
-            module_of(cd).load_state_dict(torch.load(args.cm_save, map_location=device))
+            t = torch.zeros(1, 1, device=device).expand(bsz, -1)
+            module_of(cd).load_state_dict(load_cm_package(args.cm_save, device))
             x = cd(x_ini, x_ini, t, func_args).squeeze(1)
             rel_diff = (x - x_traj[:, -1]).norm() / x_traj[:, -1].norm()
             print(f"Relative error: {rel_diff.item()}")

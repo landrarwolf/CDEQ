@@ -1,6 +1,6 @@
 # CDEQ Agent Notes
 
-Last updated: 2026-07-02.
+Last updated: 2026-07-03.
 
 ## Scope
 
@@ -157,6 +157,13 @@ python train_transformer.py --debug --gpu-count 1 -CM \
 - Remote project path: `/home/ljc/Code/DEQ/DEQ-Sequence`.
 - Conda init path: `/opt/anaconda3/etc/profile.d/conda.sh`.
 - Conda env: `IGNN`.
+- Local private key: `/Users/landrarwolf/Documents/CDEQ/私钥.txt`.
+- Use the key only for SSH/SCP/rsync to this project server. Never print,
+  paste, sync, upload, or commit the key contents.
+- Keep the key file local, untracked, and permission-restricted:
+  `chmod 600 /Users/landrarwolf/Documents/CDEQ/私钥.txt`.
+- When using the key explicitly, quote the path and force that identity:
+  `ssh -i "/Users/landrarwolf/Documents/CDEQ/私钥.txt" -o IdentitiesOnly=yes -o UpdateHostKeys=no pc-cot-120`.
 - Use this remote prefix:
 
 ```sh

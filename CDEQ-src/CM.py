@@ -64,8 +64,8 @@ class ConsistencyFunction(nn.Module):
             outputs = self.mlp(inputs)
 
             return (
-                    ((T - t) / (T - EPSILON)).view(-1, 1, 1) * x
-                    + ((t - EPSILON) / (T - EPSILON)).view(-1, 1, 1) * outputs
+                    ((T - t) / T).view(-1, 1, 1) * outputs
+                    + (t / T).view(-1, 1, 1) * x
             )
 
         # len(x.shape) == 2
@@ -75,13 +75,12 @@ class ConsistencyFunction(nn.Module):
         #     inputs = torch.cat([x, t.unsqueeze(-1)], dim=-1)
         #     outputs = F.relu(self.gc(inputs, self.adj))
         #
-        #     return ((T - t) / (T - EPSILON)).unsqueeze(-1) * x + ((t - EPSILON) / (T - EPSILON)).unsqueeze(-1) * outputs
+        #     return ((T - t) / T).unsqueeze(-1) * outputs + (t / T).unsqueeze(-1) * x
 
 
 # load data
 x_list = torch.load('x_list.pt')
-# 将x_traj逆向排列 -> X[0]为不动点，X[-1]为初始点
-x_list = x_list[::-1]
+# x_traj[0] is the initial z=0 point; x_traj[-1] is the fixed-point approximation.
 # 将list转为矩阵
 x_traj = torch.stack(x_list, dim=0)
 
@@ -146,10 +145,10 @@ with trange(N_EPOCHS) as pbar:
                 out_tn = ct_ema(x_tn, tn)
             loss_1 = F.mse_loss(ct(x_tn_1, tn_1), out_tn)
 
-            # 全局损失:F(x_tn, tn) -> x_fixed
-            x_fixed = x_traj[0].unsqueeze(0).expand(batch_size, num_nodes, nfeat)  # 不动点
+            # 全局损失:F(x_tn, tn) -> x_endpoint
+            x_endpoint = x_traj[-1].unsqueeze(0).expand(batch_size, num_nodes, nfeat)  # 不动点
             # t_steps_0 = torch.tensor(t_steps[0]).cuda()  # t=EPSILON
-            loss_2 = F.mse_loss(ct(x_tn, tn), x_fixed)
+            loss_2 = F.mse_loss(ct(x_tn, tn), x_endpoint)
             # loss_2 = loss_2 * (1/batch_size)
 
             loss = 0 * loss_1 + 1 * loss_2
@@ -167,7 +166,7 @@ with trange(N_EPOCHS) as pbar:
 
         # Inference
         with torch.no_grad():
-            x_ini = x_traj[-1]
+            x_ini = x_traj[0]
             # 将x_ini的shape变为(1, 3327, 256)
             # x_ini = x_ini.unsqueeze(0).cuda()
 
@@ -177,11 +176,11 @@ with trange(N_EPOCHS) as pbar:
             # x = ct(x_ini, t)
 
             # new
-            t = torch.tensor(t_steps[-1]).cuda()  # 直接取最后时间步：T == 5
+            t = torch.tensor(0.0).cuda()
             x = ct(x_ini.unsqueeze(0), t)
 
             # 计算x与x_traj最后一个样本点的相对误差
-            rel_diff = (x - x_traj[0]).norm() / x_traj[0].norm()
+            rel_diff = (x - x_traj[-1]).norm() / x_traj[-1].norm()
             print(f" Relative error: {rel_diff.item()}")
 
 # # Visualize the generated distribution of consistency_training
