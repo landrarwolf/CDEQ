@@ -109,8 +109,11 @@ candidate states rather than one chronological list. Cache construction
 deduplicates those candidates, evaluates the frozen Abel one-step transition,
 and retains the longest strictly aligned path ending at the self-mapping
 endpoint. Off-path augmented candidates are recorded and discarded; a block
-with no valid path is rejected. Data is split by a stable hash of `data_id`, so
-augmented blocks from one problem never cross train/validation.
+with no valid path is rejected. Cache construction first counts complete
+`data_id` groups, orders groups by a seeded stable hash, and fills a
+record-level validation target without splitting a group. This both guarantees
+enough validation candidates and prevents augmented blocks from one problem
+crossing train/validation.
 
 Each 128-example safetensors shard contains:
 

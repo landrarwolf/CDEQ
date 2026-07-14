@@ -94,6 +94,27 @@ def feasibility_summary(rows: list[dict]) -> dict:
     if set(variants) != required:
         return {"complete": False, "reason": "requires exactly one row for each Init x CT variant"}
     baseline = variants[(0, 0)]
+    baseline_initial_error = baseline.get("initial_endpoint_relative_error")
+    baseline_initial_token = baseline.get("initial_token_agreement")
+    baseline_gate = {
+        "available": baseline_initial_error is not None
+        and baseline_initial_error > 0
+        and baseline_initial_token is not None
+    }
+    if baseline_gate["available"]:
+        baseline_error_gain = (
+            baseline_initial_error - baseline["endpoint_relative_error"]
+        ) / baseline_initial_error
+        baseline_token_gain = baseline["token_agreement"] - baseline_initial_token
+        baseline_gate.update(
+            {
+                "endpoint_error_relative_gain": baseline_error_gain,
+                "token_agreement_absolute_gain": baseline_token_gain,
+                "passes": baseline_error_gain >= 0.20 and baseline_token_gain >= 0.05,
+            }
+        )
+    else:
+        baseline_gate["passes"] = False
 
     def improvement(row: dict) -> dict:
         error_gain = (
@@ -124,10 +145,15 @@ def feasibility_summary(rows: list[dict]) -> dict:
     )
     return {
         "complete": True,
+        "baseline_vs_identity": baseline_gate,
         "init_only": init,
         "ct_only": ct,
         "init_ct_best_or_tied_on_primary_metric": combined_best,
         "passes_single_seed_direction_gate": init["passes_component_gate"]
+        and ct["passes_component_gate"]
+        and combined_best,
+        "passes_single_seed_feasibility_gate": baseline_gate["passes"]
+        and init["passes_component_gate"]
         and ct["passes_component_gate"]
         and combined_best,
         "note": "Three-seed direction and baseline-vs-identity gates require their matched reruns.",
@@ -182,6 +208,8 @@ def main() -> None:
         checkpoint = torch.load(
             run_dir / "best.pt", map_location="cpu", weights_only=False
         )
+        run_manifest = json.loads((run_dir / "run_manifest.json").read_text(encoding="utf-8"))
+        initial = run_manifest["initial_validation_metrics"]
         metrics = checkpoint["best_validation_metrics"]
         table_rows.append(
             {
@@ -191,6 +219,8 @@ def main() -> None:
                 "endpoint_relative_error": metrics["endpoint_relative_error"],
                 "token_agreement": metrics["token_agreement"],
                 "exact_block_match": metrics["exact_block_match"],
+                "initial_endpoint_relative_error": initial["endpoint_relative_error"],
+                "initial_token_agreement": initial["token_agreement"],
                 "trainable_parameters": checkpoint["trainable_parameter_count"],
                 "trainable_fraction": checkpoint["trainable_fraction"],
             }
