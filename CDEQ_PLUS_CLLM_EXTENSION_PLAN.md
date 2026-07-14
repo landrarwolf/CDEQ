@@ -10,6 +10,30 @@
 >
 > 边界：本文档不修改、替代或中断当前并行进行的 CDEQ+ 实现和实验。
 
+## 0. 2026-07-14 执行补充与固定协议
+
+本轮可行性验证已经固定为 GSM8K、greedy decoding、Jacobi block size 16；先复现
+官方 CLLM checkpoint，不将 7B CLLM 全量重训作为前置条件。固定上游版本和远端
+目录记录在 `CLLM-src/UPSTREAM.md` 与 `CLLM-src/configs/llm_cdeq/gsm8k.yaml`。
+
+连续时间方向统一为：`y0 → epsilon=0.002`，`yK → T=5`，`rho=7`；`t=T`
+为严格 identity boundary，训练域为 `[epsilon,T]`，一步推理使用既有 CDEQ 的
+`t=0` boundary 调用。离散 loss 固定为 `0.1 × adjacent EMA MSE + 0.9 × endpoint
+SmoothL1`，CT 使用 `q=1.1,d=100,k=8,b=1` 的 progressive rule。
+
+工程实现隔离在 `CLLM-src/llm_cdeq/`，四个稳定入口分别为 `prepare_states`、
+`train`、`evaluate` 和 `profile`。模型、原始轨迹、hidden cache、checkpoint 与实验
+输出只保存在远端，不进入 Git。本轮成功门槛是证明 CDEQ-Jacobi 学到非退化的
+单步 endpoint mapping，Init 和 CT 分别具有正向作用，Init+CT 最佳或并列最佳；
+暂不要求超过 CLLM。
+
+官方 `augTrue` 数据经实物检查后还需一个确定性的规范化步骤：其
+`answer_trajectory_ids` 含有重复、交错的 augmented candidates，并非可直接按 JSON
+下标解释的时间序列。缓存构造因此先用冻结 Abel 的一次 token transition 建图，
+再保留到达 self-mapping endpoint 的最长严格对齐链。只有链上满足
+`LMHead(R(x,y^k))=y^(k+1)` 的状态进入连续 hidden trajectory；不会按原始 JSON
+顺序插值，也不会对 token ID 插值。
+
 ## 1. 最终决策
 
 LLM 部分应定位为 **CDEQ+ 的跨领域应用验证**，而不是一篇新的并行解码方法。
@@ -223,8 +247,8 @@ delta_u -> up_projection   -> delta_h
 当前参考 loss 可以在概念上保留：
 
 ```text
-loss = 0.2 * adjacent_ema_consistency
-     + 0.8 * endpoint_regression.
+loss = 0.1 * adjacent_ema_consistency
+     + 0.9 * endpoint_regression.
 ```
 
 hidden state 场景可以考虑 normalized MSE 或 cosine distance；logit 场景可以考虑
@@ -264,7 +288,7 @@ t_j = (
 当前默认值为：
 
 ```text
-N = 38
+N = 实际 Jacobi 轨迹长度
 epsilon = 0.002
 T = 5
 rho = 7
@@ -272,11 +296,11 @@ rho = 7
 
 在 LLM 轨迹中：
 
-- 将 Jacobi 轨迹起点映射到高 time/noise；
-- 将收敛终点映射到低 time/noise；
+- 将 Jacobi 轨迹起点 `y0` 映射到 `epsilon=0.002`；
+- 将收敛终点 `yK` 映射到 `T=5`；
 - 使用现有 progressive rule 采样连续 `r < t`；
 - 只在连续 hidden/logit states 之间进行插值；
-- 保持原 CDEQ+ boundary-condition design。
+- 保持 `t=T` 严格返回输入、一步推理从 `t=0` 调用的 boundary design。
 
 continuous-time mechanism 应被描述为同一个 CDEQ+ 组件在新场景中的复用，
 而不是新的 LLM diffusion model。
@@ -540,9 +564,9 @@ scripts/llm_cdeq/
   evaluate_matrix.sh
 ```
 
-以上只是后续建议布局，本文档阶段不创建这些文件。第一版应尽可能复用已验证的
-consistency module，同时把 LLM-specific mask、EOS、block construction 和 state
-extraction 隔离在独立代码中。
+第一版已按该原则落地到 `CLLM-src/llm_cdeq/`，并把 mask、EOS、block
+construction、state extraction、cache schema 和 checkpoint schema 隔离在官方
+CLLM 源码之外。现有 DEQ/CDEQ 入口未被改写。
 
 每个 checkpoint/trajectory 必须保存：
 
@@ -626,15 +650,15 @@ Section 7 建议篇幅：
 
 ### 14.1 Research design
 
-- [ ] 固定 LLM 只是 application section 的角色。
-- [ ] 选择第一个 CLLM-compatible model/task。
-- [ ] 决定使用 hidden states 还是 logits。
-- [ ] 确定 module dimension 或 bottleneck rank。
-- [ ] 固定一步训练和一步推理的精确定义。
+- [x] 固定 LLM 只是 application section 的角色。
+- [x] 选择第一个 CLLM-compatible model/task：GSM8K / Abel-7B / block 16。
+- [x] 决定使用 final-layer shifted hidden states。
+- [x] 确定 `4096→512→4096` bottleneck。
+- [x] 固定一步训练和一步推理的精确定义。
 
 ### 14.2 Implementation
 
-- [ ] 用 Git/checkpoint metadata 保护当前 CDEQ+ baseline。
+- [x] 用 Git 分支与快照 commit 保护当前 CDEQ+ baseline。
 - [ ] 复现 AR/Jacobi endpoint equivalence。
 - [ ] 保存 deterministic Jacobi trajectories。
 - [ ] 训练 CDEQ-Jacobi baseline。

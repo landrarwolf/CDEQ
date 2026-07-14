@@ -1,0 +1,59 @@
+schema_version: llm_cdeq_config_v1
+upstream:
+  code_revision: 22775363f8563c63620e71f7a204e90a51d6a379
+  target_model_id: GAIR/Abel-7B-001
+  target_model_revision: 3439c5a654dac2320d228d11a0c5590346e81d1a
+  tokenizer_id: GAIR/Abel-7B-001
+  tokenizer_revision: 3439c5a654dac2320d228d11a0c5590346e81d1a
+  cllm_model_id: cllm/consistency-llm-7b-math
+  cllm_model_revision: 904a1eefdf8e33a3440ddea35a55dd75cead648c
+  trajectory_dataset_id: cllm/cleaned_gsm8k_train_jacobian16_augTrue_labels_True_max_seq_len_256
+  trajectory_dataset_revision: d29940a2d0ac1dea42e92d758598c64c0041a3c1
+paths:
+  target_model: /home/ljc/models/cllm/Abel-7B-001
+  cllm_model: /home/ljc/models/cllm/consistency-llm-7b-math
+  trajectory_json: /home/ljc/data/cllm/cleaned_gsm8k_train_jacobian16_augTrue_labels_True_max_seq_len_256.json
+  cache_dir: /home/ljc/data/cllm/hidden_state_cache/gsm8k_v1
+  output_dir: /home/ljc/experiments/cllm-cdeq
+  gsm8k_test: eval/gsm8k/test.jsonl
+model:
+  hidden_size: 4096
+  bottleneck_rank: 512
+  mlp_multiplier: 3
+  block_size: 16
+  max_trajectory_states: 17
+  hidden_layer: -1
+  representation: final_hidden_shifted
+time:
+  epsilon: 0.002
+  terminal: 5.0
+  rho: 7.0
+  q: 1.1
+  d: 100
+  k: 8.0
+  b: 1.0
+training:
+  seed: 42
+  train_limit: 10000
+  validation_limit: 1000
+  shard_size: 128
+  state_batch_size: 4
+  batch_size: 32
+  gradient_accumulation: 4
+  epochs: 20
+  patience: 3
+  learning_rate: 0.0003
+  init_learning_rate: 0.0001
+  init_steps: 10
+  weight_decay: 0.01
+  ema_decay: 0.98
+  local_weight: 0.1
+  endpoint_weight: 0.9
+  token_ce_weight: 0.0
+  loss: adjacent_ema_mse_plus_endpoint_smooth_l1
+  dtype: bfloat16
+evaluation:
+  sample_limit: 500
+  max_new_tokens: 1024
+  warmup_samples: 1
+  attention_backend: flash_attention_2

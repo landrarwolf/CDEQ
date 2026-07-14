@@ -1,0 +1,20 @@
+# Algorithm-relevant subset of the official environment.
+torch==2.1.2
+transformers==4.36.2
+accelerate==0.25.0
+datasets==2.15.0
+fschat==0.2.34
+flash-attn==2.4.1
+huggingface-hub==0.19.4
+safetensors==0.4.1
+numpy==1.26.3
+PyYAML==6.0.1
+tqdm==4.66.1
+jsonlines==4.0.0
+ijson==3.2.3
+peft==0.7.1
+pytest==8.3.5
+matplotlib==3.8.2
+sentencepiece==0.1.99
+sympy==1.12
+ninja==1.11.1.1

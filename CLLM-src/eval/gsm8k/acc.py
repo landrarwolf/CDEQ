@@ -213,6 +213,8 @@ if __name__ == '__main__':
     parser.add_argument('--top_p', type=float, default=1.0)
     parser.add_argument('--presence_penalty', type=float, default=0.0)
     parser.add_argument('--frequency_penalty', type=float, default=0.0)
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--attention_backend', choices=('flash_attention_2', 'sdpa', 'eager'), default='eager')
     parser.add_argument('--output_file_name', type=str, default='output.json')
     parser.add_argument('--stop', type=str, nargs='+', default=[], help="you can pass one or multiple stop strings to halt the generation process.")
     parser.add_argument('--dev_set', type=str, default='all')
@@ -232,6 +234,8 @@ if __name__ == '__main__':
         help="The n-gram for consistency decoding.",
     ) 
     args = parser.parse_args()
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
     max_new_token = args.max_tokens
     if args.eval_only == False:
         # part 1 we set the model and tokenizer
@@ -240,6 +244,7 @@ if __name__ == '__main__':
             torch_dtype=torch.bfloat16,
             low_cpu_mem_usage=True,
             device_map='cuda',
+            attn_implementation=args.attention_backend,
         )
         tokenizer = transformers.AutoTokenizer.from_pretrained(
             args.model_dir,

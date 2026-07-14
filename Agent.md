@@ -7,7 +7,7 @@ Last updated: 2026-07-03.
 - Maintained code path: `CDEQ-src/DEQ-Sequence`.
 - Main entrypoint: `CDEQ-src/DEQ-Sequence/train_transformer.py`.
 - Do not revive old forked entrypoints or shell wrappers. Use flags on `train_transformer.py`.
-- Current local branch during this work: `codex/deq-local-run`.
+- Current local branch for the CLLM extension: `codex/cllm-cdeq-plus`.
 - The old top-level `DEQ-Sequence/` copy and root `README.md` were removed intentionally during cleanup. `IGNN/` and `MDEQ/` are kept for later adaptation work.
 
 ## Core CDEQ Algorithm In This Code
@@ -181,6 +181,22 @@ Remote smoke checks previously passed in `IGNN`:
 - Picard `-CM` inference from the temporary CM weight.
 - Anderson trajectory/train/inference also works when explicitly selected.
 - Picard trajectory plus Anderson training correctly fails with `Trajectory solver mismatch`.
+
+### CLLM/CDEQ+ Runtime
+
+- Isolated local source: `CLLM-src/`.
+- Remote source: `/home/ljc/Code/Consistency_LLM_CDEQ`.
+- Remote conda env: `cllm-cdeq` (Python 3.10).
+- Remote-only model root: `/home/ljc/models/cllm`.
+- Remote-only data/cache root: `/home/ljc/data/cllm`.
+- Remote-only experiment root: `/home/ljc/experiments/cllm-cdeq`.
+- Run CLLM commands from the remote source root after activating `cllm-cdeq`.
+- Keep official model/data revisions pinned to `CLLM-src/UPSTREAM.md` and
+  `CLLM-src/configs/llm_cdeq/gsm8k.yaml`.
+- Never sync model weights, Jacobi JSON, hidden-state shards, checkpoints, or
+  experiment outputs back into Git.
+- For source updates, first run an rsync dry-run and use whitelist-style
+  includes for `llm_cdeq/`, configs, tests, scripts, and documentation.
 
 ## Sync Rules
 

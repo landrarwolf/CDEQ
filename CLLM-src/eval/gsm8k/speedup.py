@@ -100,9 +100,12 @@ def jacobian_speed_evaluate(processed_prompt, model, tokenizer, max_new_tokens, 
     return eos_reached, time_speed, converge_step, jacobi_generation, decoded_generation, all_jacobian_trajectory
     
 def speed_compare(args):
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
     # Load model and tokenizer
     model = transformers.LlamaForCausalLM.from_pretrained(args.test_model_path, low_cpu_mem_usage=True, device_map='auto', 
-                                             torch_dtype=torch.bfloat16, attn_implementation="flash_attention_2")
+                                             torch_dtype=torch.bfloat16, attn_implementation=args.attention_backend)
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         args.teacher_model_path,
         padding_side="right",
@@ -290,7 +293,7 @@ def speed_compare(args):
     print(f"global average fix-point cnt: {np.average(fast_forward_and_fix_points_statistics['fix_points'])}")
     print(f"global average fix-point per gram cnt: {np.average(fast_forward_and_fix_points_statistics['fix_points_per_gram'])}")
     
-    save_path = 'data/speedup_profiling_results/'
+    save_path = args.output_dir
     if not os.path.exists(save_path):
         os.makedirs(save_path)
 
@@ -321,7 +324,12 @@ if __name__ == "__main__":
                         default="models/vicuna-7b-sharegpt-gpt4-48k")
     parser.add_argument("--teacher_model_path", type=str,
                         default="cllm/consistency-llm-7b-sharegpt48k")
-    parser.add_argument("--data_size", type=str,
+    parser.add_argument("--data_size", type=int,
                         default=500)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--attention_backend", choices=("flash_attention_2", "sdpa"),
+                        default="flash_attention_2")
+    parser.add_argument("--output_dir", type=str,
+                        default="data/speedup_profiling_results/")
     args = parser.parse_args() 
     speed_compare(args)

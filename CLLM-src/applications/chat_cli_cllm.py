@@ -79,6 +79,8 @@ if __name__ == "__main__":
     parser.add_argument("--dtype", type=str, default="float16")
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--cache_dir", type=str, default="")
+    parser.add_argument("--attention_backend", choices=("flash_attention_2", "sdpa"),
+                        default="flash_attention_2")
     parser.add_argument(
         "--max_new_tokens",
         type=int,
@@ -110,7 +112,7 @@ if __name__ == "__main__":
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
         device_map='cuda',
-        attn_implementation="flash_attention_2",
+        attn_implementation=args.attention_backend,
     )
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         args.model_path,
@@ -170,4 +172,3 @@ if __name__ == "__main__":
             print("====================================================================================================")
         if not args.chat:
             break
-

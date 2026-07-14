@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.DS_Store
+
+# Runtime artifacts stay on the remote server and out of Git.
+models/
+data/collected_jacobi_trajectory/
+data/hidden_state_cache/
+outputs/
+results/
+wandb/
+*.pt
+*.pth
+*.safetensors
+
