@@ -24,7 +24,12 @@ for path in (str(SEQ_DIR), str(DEQ_DIR)):
 from data_utils import get_lm_corpus
 from lib.solvers import anderson
 from models.deq_transformer import DEQTransformerLM
-from models.deq_transformer_CD import ConsistencyFunction
+from models.deq_transformer_CD import (
+    ConsistencyFunction,
+    InitialStatePredictor,
+    interpolate_trajectory,
+    sample_continuous_pair,
+)
 from utils.data_parallel import BalancedDataParallel
 from utils.exp_utils import create_exp_dir
 
@@ -221,6 +226,22 @@ def build_parser():
                         help="CM trajectory batch size")
     parser.add_argument("--cm-train-points", type=int, default=8,
                         help="trajectory points sampled per CM training batch")
+    parser.add_argument("--cdeq-init", action="store_true",
+                        help="train/load a CDEQ+ initializer for the CM start point")
+    parser.add_argument("--cdeq-init-lr", type=float, default=1e-4,
+                        help="learning rate for the CDEQ+ initializer")
+    parser.add_argument("--cdeq-init-steps", type=int, default=10,
+                        help="initializer optimization steps per CM batch")
+    parser.add_argument("--cm-continuous-time", action="store_true",
+                        help="sample continuous (t, r) pairs for CM training")
+    parser.add_argument("--cm-ct-q", type=float, default=1.1,
+                        help="continuous-time schedule q")
+    parser.add_argument("--cm-ct-d", type=int, default=100,
+                        help="continuous-time schedule iteration divisor")
+    parser.add_argument("--cm-ct-k", type=float, default=8.0,
+                        help="continuous-time schedule sigmoid scale")
+    parser.add_argument("--cm-ct-b", type=float, default=1.0,
+                        help="continuous-time schedule sigmoid slope")
     return parser
 
 
@@ -236,6 +257,16 @@ def parse_args(argv=None):
         parser.error("--batch_size must be divisible by --batch_chunk")
     if args.attn_type != 0:
         parser.error("only --attn_type 0 is supported")
+    if args.cm_continuous_time and args.trajectory_solver != "picard":
+        parser.error("--cm-continuous-time currently supports --trajectory-solver picard")
+    if args.cm_ct_q <= 1:
+        parser.error("--cm-ct-q must be > 1")
+    if args.cm_ct_d <= 0:
+        parser.error("--cm-ct-d must be > 0")
+    if args.cdeq_init_lr <= 0:
+        parser.error("--cdeq-init-lr must be > 0")
+    if args.cdeq_init_steps <= 0:
+        parser.error("--cdeq-init-steps must be > 0")
 
     args.tied = not args.not_tied
     args.pretrain_steps += args.start_train_steps
@@ -564,6 +595,7 @@ def evaluate(args, eval_iter, model, para_model, logging, save_trajectory=False,
                     kwargs["CM_load"] = cm_load
                     kwargs["CM_solver"] = args.trajectory_solver
                     kwargs["CM_compare_teacher"] = args.cm_compare_teacher
+                    kwargs["CDEQ_init"] = args.cdeq_init
                 ret = para_model(
                     data,
                     target,
@@ -602,30 +634,68 @@ def module_of(model):
     return model.module if hasattr(model, "module") else model
 
 
-def save_cm_package(path, cd):
+def save_cm_package(path, cd, init_model=None, args=None, cm_global_step=0):
     save_dir = os.path.dirname(path)
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
+    package = {
+        "cm_time_convention": TRAJECTORY_FORMAT_VERSION,
+        "model": module_of(cd).state_dict(),
+        "cm_global_step": cm_global_step,
+    }
+    if args is not None:
+        package["cm_method"] = "cdeq_plus" if args.cdeq_init or args.cm_continuous_time else "cdeq"
+        package["cm_continuous_time"] = args.cm_continuous_time
+        package["cdeq_init"] = args.cdeq_init
+        package["cdeq_init_lr"] = args.cdeq_init_lr
+        package["cdeq_init_steps"] = args.cdeq_init_steps
+        package["cm_ct_params"] = {
+            "q": args.cm_ct_q,
+            "d": args.cm_ct_d,
+            "k": args.cm_ct_k,
+            "b": args.cm_ct_b,
+        }
+    if init_model is not None:
+        package["init_model"] = module_of(init_model).state_dict()
     torch.save(
-        {
-            "cm_time_convention": TRAJECTORY_FORMAT_VERSION,
-            "model": module_of(cd).state_dict(),
-        },
+        package,
         path,
     )
 
 
-def load_cm_package(path, device):
+def load_cm_package(path, device, require_init=False):
     state = torch.load(path, map_location=device)
-    if not isinstance(state, dict) or state.get("cm_time_convention") != TRAJECTORY_FORMAT_VERSION:
+    if isinstance(state, dict) and "model" in state:
+        if state.get("cm_time_convention") != TRAJECTORY_FORMAT_VERSION:
+            raise ValueError(
+                f"CM weights {path} do not match {TRAJECTORY_FORMAT_VERSION}. "
+                "Retrain the CM before using these weights."
+            )
+    elif isinstance(state, dict):
+        state = {"model": state}
+    else:
         raise ValueError(
-            f"CM weights {path} do not match {TRAJECTORY_FORMAT_VERSION}. "
-            "Retrain the CM before using these weights."
+            f"CM weights {path} are not a valid state dict or CM package."
         )
-    return state["model"]
+    if require_init and "init_model" not in state:
+        raise ValueError(f"CM weights {path} do not contain init_model; rerun --train-CM --cdeq-init.")
+    return state
 
 
-def train_on_trajectory(args, cd, cd_ema, params_ema, optimizer, dataloader, t_traj, n_epochs, best_rel_diff):
+def train_on_trajectory(
+    args,
+    cd,
+    cd_ema,
+    params_ema,
+    optimizer,
+    dataloader,
+    t_traj,
+    n_epochs,
+    best_rel_diff,
+    init_model=None,
+    init_optimizer=None,
+    cm_global_step=0,
+):
     rel_diff_append = []
     loss_append = []
     tot_loss = 0.0
@@ -648,27 +718,63 @@ def train_on_trajectory(args, cd, cd_ema, params_ema, optimizer, dataloader, t_t
                 batch_size = x_batch.size(0)
                 current_func_args = data[1:]
                 batch_t_traj = t_traj.to(x_batch.device)
+                x_endpoint = x_batch[:, -1]
+                qlen = x_batch.size(-1)
 
-                tn_1 = batch_t_traj[n_1]
-                tn = batch_t_traj[(np.array(n_1) - 1).tolist()]
-                x_tn_1 = x_batch[:, n_1]
-                x_tn = x_batch[:, (np.array(n_1) - 1).tolist()]
-                x_tn_prev = x_batch[:, np.maximum(np.array(n_1) - 2, 0).tolist()]
+                if args.cm_continuous_time:
+                    tn_1, tn = sample_continuous_pair(
+                        batch_t_traj,
+                        n_steps,
+                        cm_global_step,
+                        q=args.cm_ct_q,
+                        d=args.cm_ct_d,
+                        k=args.cm_ct_k,
+                        b=args.cm_ct_b,
+                    )
+                    x_tn_1 = interpolate_trajectory(x_batch, batch_t_traj, tn_1)
+                    x_tn = interpolate_trajectory(x_batch, batch_t_traj, tn)
+                    x_tn_prev = x_tn
+                else:
+                    tn_1 = batch_t_traj[n_1]
+                    tn = batch_t_traj[(np.array(n_1) - 1).tolist()]
+                    x_tn_1 = x_batch[:, n_1]
+                    x_tn = x_batch[:, (np.array(n_1) - 1).tolist()]
+                    x_tn_prev = x_batch[:, np.maximum(np.array(n_1) - 2, 0).tolist()]
+
+                z_init = None
+                init_loss_value = None
+                if init_model is not None:
+                    for _ in range(args.cdeq_init_steps):
+                        init_optimizer.zero_grad()
+                        z_pred = init_model(current_func_args[0][:, :, -qlen:])
+                        init_loss = F.smooth_l1_loss(z_pred, x_endpoint.detach())
+                        init_loss.backward()
+                        init_optimizer.step()
+                    init_loss_value = init_loss.item()
+                    with torch.no_grad():
+                        z_init = init_model(current_func_args[0][:, :, -qlen:]).detach()
 
                 with torch.no_grad():
                     out_tn = cd_ema(x_tn, x_tn_prev, tn.unsqueeze(0).expand(x_tn.size(0), -1), current_func_args)
+                optimizer.zero_grad()
                 loss_1 = F.mse_loss(
                     cd(x_tn_1, x_tn, tn_1.unsqueeze(0).expand(x_tn.size(0), -1), current_func_args),
                     out_tn,
                 )
-                x_endpoint = x_batch[:, -1].unsqueeze(1).expand(-1, n_steps, -1, -1)
+                x_endpoint_steps = x_endpoint.unsqueeze(1).expand(-1, n_steps, -1, -1)
                 loss_2_x = cd(x_tn, x_tn_prev, tn.unsqueeze(0).expand(x_tn.size(0), -1), current_func_args)
-                loss_2 = F.smooth_l1_loss(loss_2_x, x_endpoint)
-                loss = 0.1 * loss_1 + 0.9 * loss_2
+                loss_2 = F.smooth_l1_loss(loss_2_x, x_endpoint_steps)
+                global_loss = loss_2
+                if z_init is not None:
+                    t0 = torch.zeros(batch_size, 1, device=x_batch.device, dtype=batch_t_traj.dtype)
+                    anchor = cd(z_init.unsqueeze(1), z_init.unsqueeze(1), t0, current_func_args)
+                    global_loss = 0.5 * (loss_2 + F.smooth_l1_loss(anchor, x_endpoint.unsqueeze(1)))
+                loss = 0.1 * loss_1 + 0.9 * global_loss
 
                 loss.backward()
                 optimizer.step()
                 optimizer.zero_grad()
+                cm_global_step += 1
 
                 params_ema = {
                     key: 0.98 * params_ema[key] + 0.02 * value
@@ -679,22 +785,29 @@ def train_on_trajectory(args, cd, cd_ema, params_ema, optimizer, dataloader, t_t
 
                 was_training = cd.training
                 cd.eval()
+                if init_model is not None:
+                    init_model.eval()
                 with torch.no_grad():
-                    x_ini = x_batch[:, 0:1]
-                    t0 = torch.zeros(1, device=x_batch.device)
+                    if init_model is None:
+                        x_ini = x_batch[:, 0:1]
+                    else:
+                        x_ini = init_model(current_func_args[0][:, :, -qlen:]).unsqueeze(1)
+                    t0 = torch.zeros(1, device=x_batch.device, dtype=batch_t_traj.dtype)
                     x1 = cd(x_ini, x_ini, t0.expand(batch_size, -1), current_func_args)
                     rel_diff = (x1 - x_batch[:, -1:]).norm() / x_batch[:, -1:].norm()
                     rel_diff_append.append(rel_diff.item())
                     epoch_rel_diffs.append(rel_diff.item())
-                    loss_append.append(loss.item())
+                    loss_append.append(init_loss_value if init_loss_value is not None else loss.item())
                 if was_training:
                     cd.train()
+                    if init_model is not None:
+                        init_model.train()
 
             tot_loss = epoch_loss / len(dataloader)
             epoch_rel_diff = sum(epoch_rel_diffs) / len(epoch_rel_diffs)
             if epoch_rel_diff < best_rel_diff:
                 best_rel_diff = epoch_rel_diff
-                save_cm_package(args.cm_save, cd)
+                save_cm_package(args.cm_save, cd, init_model=init_model, args=args, cm_global_step=cm_global_step)
             print(
                 f"CM epoch {epoch + 1}/{n_epochs}: "
                 f"loss={tot_loss:.6f}, rel_diff={epoch_rel_diff:.6f}, best_rel_diff={best_rel_diff:.6f}"
@@ -702,7 +815,7 @@ def train_on_trajectory(args, cd, cd_ema, params_ema, optimizer, dataloader, t_t
             pbar.set_postfix(epoch=epoch + 1, loss=tot_loss, rel_diff=epoch_rel_diff, best=best_rel_diff)
             pbar.update()
 
-    return tot_loss, rel_diff_append, loss_append, params_ema, best_rel_diff
+    return tot_loss, rel_diff_append, loss_append, params_ema, best_rel_diff, cm_global_step
 
 
 def train_consistency_model(args, device, device_ids, func_params_dict):
@@ -717,7 +830,11 @@ def train_consistency_model(args, device, device_ids, func_params_dict):
         solver=args.trajectory_solver,
     ).to(device)
     cd.func.load_state_dict(func_params_dict)
-    optimizer = torch.optim.AdamW(cd.parameters(), lr=4e-3)
+    for param in cd.func.parameters():
+        param.requires_grad = False
+    optimizer = torch.optim.AdamW([param for param in cd.parameters() if param.requires_grad], lr=4e-3)
+    init_model = InitialStatePredictor(args.d_model).to(device) if args.cdeq_init else None
+    init_optimizer = torch.optim.AdamW(init_model.parameters(), lr=args.cdeq_init_lr) if init_model is not None else None
     cd_ema = ConsistencyFunction(
         n_head=args.n_head,
         d_model=args.d_model,
@@ -729,11 +846,16 @@ def train_consistency_model(args, device, device_ids, func_params_dict):
         solver=args.trajectory_solver,
     ).to(device)
     cd_ema.load_state_dict(cd.state_dict())
+    for param in cd_ema.func.parameters():
+        param.requires_grad = False
     params_ema = cd_ema.state_dict()
+    cm_global_step = 0
 
     if device.type == "cuda" and len(device_ids) > 1:
         cd = nn.DataParallel(cd, device_ids=device_ids, dim=0).to(device)
         cd_ema = nn.DataParallel(cd_ema, device_ids=device_ids, dim=0).to(device)
+        if init_model is not None:
+            init_model = nn.DataParallel(init_model, device_ids=device_ids, dim=0).to(device)
 
     if os.path.exists(args.cm_checkpoint):
         checkpoint = torch.load(args.cm_checkpoint, map_location=device)
@@ -746,6 +868,15 @@ def train_consistency_model(args, device, device_ids, func_params_dict):
         module_of(cd_ema).load_state_dict(checkpoint["model_ema"])
         params_ema = checkpoint["params_ema"]
         optimizer.load_state_dict(checkpoint["optimizer"])
+        cm_global_step = checkpoint.get("cm_global_step", 0)
+        if init_model is not None:
+            if "init_model" not in checkpoint:
+                raise ValueError(
+                    f"CM checkpoint {args.cm_checkpoint} does not contain init_model. "
+                    "Use a fresh --cm-checkpoint path or omit --cdeq-init."
+                )
+            module_of(init_model).load_state_dict(checkpoint["init_model"])
+            init_optimizer.load_state_dict(checkpoint["init_optimizer"])
         print(f"Loaded checkpoint from {args.cm_checkpoint}")
     else:
         print(f"No checkpoint found at {args.cm_checkpoint}, starting from scratch.")
@@ -819,7 +950,7 @@ def train_consistency_model(args, device, device_ids, func_params_dict):
             generator=torch.Generator(device=device),
         )
 
-        tot_loss, rel_diff_append, loss_append, params_ema, best_rel_diff = train_on_trajectory(
+        tot_loss, rel_diff_append, loss_append, params_ema, best_rel_diff, cm_global_step = train_on_trajectory(
             args,
             cd,
             cd_ema,
@@ -829,6 +960,9 @@ def train_consistency_model(args, device, device_ids, func_params_dict):
             t_traj,
             args.cm_epochs,
             best_rel_diff,
+            init_model=init_model,
+            init_optimizer=init_optimizer,
+            cm_global_step=cm_global_step,
         )
         if args.plot_CM:
             import matplotlib.pyplot as plt
@@ -839,20 +973,27 @@ def train_consistency_model(args, device, device_ids, func_params_dict):
         checkpoint_dir = os.path.dirname(args.cm_checkpoint)
         if checkpoint_dir:
             os.makedirs(checkpoint_dir, exist_ok=True)
-        torch.save(
-            {
-                "model": module_of(cd).state_dict(),
-                "model_ema": module_of(cd_ema).state_dict(),
-                "params_ema": params_ema,
-                "optimizer": optimizer.state_dict(),
-                "cm_time_convention": TRAJECTORY_FORMAT_VERSION,
-            },
-            args.cm_checkpoint,
-        )
+        checkpoint = {
+            "model": module_of(cd).state_dict(),
+            "model_ema": module_of(cd_ema).state_dict(),
+            "params_ema": params_ema,
+            "optimizer": optimizer.state_dict(),
+            "cm_time_convention": TRAJECTORY_FORMAT_VERSION,
+            "cm_global_step": cm_global_step,
+        }
+        if init_model is not None:
+            checkpoint["init_model"] = module_of(init_model).state_dict()
+            checkpoint["init_optimizer"] = init_optimizer.state_dict()
+        torch.save(checkpoint, args.cm_checkpoint)
         with torch.no_grad():
-            x_ini = x_list[0].unsqueeze(1)
+            package = load_cm_package(args.cm_save, device, require_init=args.cdeq_init)
+            module_of(cd).load_state_dict(package["model"])
+            if init_model is None:
+                x_ini = x_list[0].unsqueeze(1)
+            else:
+                module_of(init_model).load_state_dict(package["init_model"])
+                x_ini = init_model(func_args[0][:, :, -x_traj.size(-1):]).unsqueeze(1)
             t = torch.zeros(1, 1, device=device).expand(bsz, -1)
-            module_of(cd).load_state_dict(load_cm_package(args.cm_save, device))
             x = cd(x_ini, x_ini, t, func_args).squeeze(1)
             rel_diff = (x - x_traj[:, -1]).norm() / x_traj[:, -1].norm()
             print(f"Relative error: {rel_diff.item()}")

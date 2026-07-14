@@ -29,6 +29,40 @@ def cm_boundary_mix(z1s, outputs, t, T=5):
     )
 
 
+class InitialStatePredictor(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+        self.net = nn.Conv1d(3 * d_model, d_model, kernel_size=1)
+        nn.init.zeros_(self.net.weight)
+        nn.init.zeros_(self.net.bias)
+
+    def forward(self, us):
+        return self.net(us)
+
+
+def interpolate_trajectory(x_traj, t_traj, t):
+    t_traj = t_traj.to(device=x_traj.device, dtype=x_traj.dtype).flatten()
+    t = t.to(device=x_traj.device, dtype=x_traj.dtype).flatten()
+    right = torch.searchsorted(t_traj, t).clamp(1, t_traj.numel() - 1)
+    left = right - 1
+    t_left = t_traj[left]
+    t_right = t_traj[right]
+    weight = ((t - t_left) / (t_right - t_left).clamp_min(torch.finfo(x_traj.dtype).eps)).view(1, -1, 1, 1)
+    return x_traj[:, left] * (1 - weight) + x_traj[:, right] * weight
+
+
+def sample_continuous_pair(t_traj, n_steps, global_step, q=1.1, d=100, k=8.0, b=1.0):
+    t_traj = t_traj.flatten()
+    eps, T = t_traj[0], t_traj[-1]
+    u = torch.rand(n_steps, device=t_traj.device, dtype=t_traj.dtype)
+    t = torch.exp(torch.log(eps) + u * (torch.log(T) - torch.log(eps)))
+    n_t = 1 + k * torch.sigmoid(-b * t)
+    q_power = q ** (global_step // max(int(d), 1))
+    r = t * (1 - n_t / q_power)
+    r = torch.minimum(r.clamp_min(eps), t)
+    return t, r
+
+
 class WeightSharePositionwiseFF(nn.Module):
     def __init__(self, d_model, d_inner, dropout, pre_lnorm=False):
         super(WeightSharePositionwiseFF, self).__init__()

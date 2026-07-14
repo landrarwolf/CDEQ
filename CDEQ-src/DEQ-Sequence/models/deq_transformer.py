@@ -26,7 +26,7 @@ from utils.positional_embedding import PositionalEmbedding
 from utils.proj_adaptive_softmax import ProjectedAdaptiveLogSoftmax
 from utils.log_uniform_sampler import LogUniformSampler, sample_logits
 
-from models.deq_transformer_CD import ConsistencyFunction, WeightSharePositionwiseFF, WeightShareSelfAttention, RelPartialLearnableDecoderLayer
+from models.deq_transformer_CD import ConsistencyFunction, InitialStatePredictor, WeightSharePositionwiseFF, WeightShareSelfAttention, RelPartialLearnableDecoderLayer
 
 class DEQTransformerLM(nn.Module):
     def __init__(self, n_token, n_layer, eval_n_layer, n_head, d_model, d_head, d_inner,
@@ -93,6 +93,7 @@ class DEQTransformerLM(nn.Module):
         # Consistency Distrillation
         self.CD = ConsistencyFunction(n_head=n_head, d_model=d_model, d_head=d_head, d_inner=d_inner,
                                  dropout=dropout, n_layer=n_layer)
+        self.CDEQ_init = InitialStatePredictor(d_model)
         self._cm_state_cache = {}
 
         # save and load the weights of func
@@ -120,17 +121,29 @@ class DEQTransformerLM(nn.Module):
             self.logging(f"Saving weight state dict at {name}.pth")
             torch.save(self.func.state_dict(), f)
 
-    def load_cm_weights(self, path, device):
+    def load_cm_weights(self, path, device, require_init=False):
         key = (path, str(device))
         if key not in self._cm_state_cache:
             state = torch.load(path, map_location=device)
-            if not isinstance(state, dict) or state.get('cm_time_convention') != 'z0_eps_to_fixed_T_v1':
+            if isinstance(state, dict) and 'model' in state:
+                if state.get('cm_time_convention') != 'z0_eps_to_fixed_T_v1':
+                    raise ValueError(
+                        f"CM weights {path} do not match z0_eps_to_fixed_T_v1. "
+                        "Retrain the CM before running -CM inference."
+                    )
+            elif isinstance(state, dict):
+                state = {'model': state}
+            else:
                 raise ValueError(
-                    f"CM weights {path} do not match z0_eps_to_fixed_T_v1. "
-                    "Retrain the CM before running -CM inference."
+                    f"CM weights {path} are not a valid state dict or CM package."
                 )
-            self._cm_state_cache[key] = state['model']
-        self.CD.load_state_dict(self._cm_state_cache[key])
+            if require_init and 'init_model' not in state:
+                raise ValueError(f"CM weights {path} do not contain init_model; rerun --train-CM --cdeq-init.")
+            self._cm_state_cache[key] = state
+        state = self._cm_state_cache[key]
+        self.CD.load_state_dict(state['model'])
+        if require_init:
+            self.CDEQ_init.load_state_dict(state['init_model'])
 
     def init_mems(self):
         if self.mem_len <= 0:
@@ -160,7 +173,8 @@ class DEQTransformerLM(nn.Module):
 
     def _forward(self, dec_inp, mems=None, f_thres=30, b_thres=40, train_step=-1,
                  compute_jac_loss=True, spectral_radius_mode=False, writer=None, save_trajectory=False,
-                 trajectory_solver='picard', CM_load=None, CM_solver='picard', CM_compare_teacher=False):
+                 trajectory_solver='picard', CM_load=None, CM_solver='picard', CM_compare_teacher=False,
+                 CDEQ_init=False):
         """
         Apply the DEQ-Transformer language model on input word tokens
 
@@ -258,7 +272,9 @@ class DEQTransformerLM(nn.Module):
                 if CM_load is not None:  # CM_load = 'best_CM_model_.pth'
                     t = torch.zeros(1, 1, device=dec_inp.device).expand(bsz, 1)
                     self.CD.set_solver(CM_solver)
-                    self.load_cm_weights(CM_load, dec_inp.device)
+                    self.load_cm_weights(CM_load, dec_inp.device, require_init=CDEQ_init)
+                    if CDEQ_init:
+                        z1s = self.CDEQ_init(us[:, :, -qlen:])
 
                     time_start = time.time()
                     z1s_step = z1s.unsqueeze(1)
@@ -333,6 +349,7 @@ class DEQTransformerLM(nn.Module):
         CM_load = kwargs.get('CM_load', None)
         CM_solver = kwargs.get('CM_solver', trajectory_solver)
         CM_compare_teacher = kwargs.get('CM_compare_teacher', False)
+        CDEQ_init = kwargs.get('CDEQ_init', False)
         hidden, new_mems, jac_loss, sradius, trajectory = self._forward(data, mems=mems, f_thres=f_thres, b_thres=b_thres,
                                                             train_step=train_step,
                                                             compute_jac_loss=compute_jac_loss,
@@ -343,6 +360,7 @@ class DEQTransformerLM(nn.Module):
                                                             CM_load=CM_load,
                                                             CM_solver=CM_solver,
                                                             CM_compare_teacher=CM_compare_teacher,
+                                                            CDEQ_init=CDEQ_init,
                                                             )
         pred_hid = hidden[-tgt_len:]
         loss = self.crit(pred_hid.view(-1, pred_hid.size(-1)), target.contiguous().view(-1))
