@@ -1,6 +1,20 @@
 import torch
 
-from llm_cdeq.model import CDEQAdapter, make_ema, trainable_parameter_count, update_ema_
+from llm_cdeq.model import (
+    CDEQAdapter,
+    RMSNormNoAffine,
+    make_ema,
+    trainable_parameter_count,
+    update_ema_,
+)
+
+
+def test_rms_norm_matches_definition_without_parameters():
+    norm = RMSNormNoAffine(4, eps=1e-6)
+    value = torch.tensor([[1.0, -2.0, 3.0, -4.0]])
+    expected = value * torch.rsqrt(value.square().mean(dim=-1, keepdim=True) + 1e-6)
+    torch.testing.assert_close(norm(value), expected)
+    assert not list(norm.parameters())
 
 
 def test_terminal_boundary_is_exact_identity():
@@ -40,4 +54,3 @@ def test_ema_updates_parameters_and_copies_integer_buffers():
 def test_adapter_is_below_one_percent_of_7b_backbone():
     adapter = CDEQAdapter(hidden_size=4096, rank=512, use_initializer=True)
     assert trainable_parameter_count(adapter) / 6_738_415_616 < 0.01
-

@@ -1,0 +1,10 @@
+{
+  "schema_version": "llm_cdeq_artifact_manifest_v1",
+  "repo_id": "cllm/cleaned_gsm8k_train_jacobian16_augTrue_labels_True_max_seq_len_256",
+  "repo_type": "dataset",
+  "revision": "d29940a2d0ac1dea42e92d758598c64c0041a3c1",
+  "files": [
+    {"path": ".gitattributes", "size": 2415, "etag": "0564825134e824a0556ab765bccbe91dd727b804"},
+    {"path": "cleaned_gsm8k_train_jacobian16_augTrue_labels_True_max_seq_len_256.json", "size": 933468928, "etag": "252c568eca46c3e023881f97de7460ada3fb633f72fb8c9b8030ac5ee70ca696"}
+  ]
+}

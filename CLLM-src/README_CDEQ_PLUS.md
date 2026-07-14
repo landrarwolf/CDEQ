@@ -40,6 +40,13 @@ official transitive versions needed by this subset are fixed in
 `environment-conda-explicit.txt`.
 If FlashAttention cannot be built, use `evaluation.attention_backend: sdpa`
 for quality checks; all speed comparisons must later use one common backend.
+The installer records the detected choice in `environment-attention-backend.txt`;
+set `STRICT_FLASH_ATTN=1` when a missing FlashAttention build should be fatal.
+Set `SKIP_FLASH_ATTN=1` after a recorded build failure to regenerate the exact
+environment locks without retrying the unavailable wheel.
+The build frontend is pinned to pip 24.0, setuptools 69.5.1, and wheel 0.42.0
+because FlashAttention 2.4.1 requires the legacy `pkg_resources` compatibility
+module and pip 26 misclassifies the official Ninja wheel on the target host.
 
 ## Stable CLI
 
@@ -73,6 +80,19 @@ bash scripts/reproduce_gsm8k.sh configs/llm_cdeq/gsm8k.yaml
 
 It runs a one-example demo, full GSM8K accuracy, the 500-example CLLM/AR speed
 profile, and 100-block Abel vanilla-Jacobi/greedy-AR endpoint equivalence.
+After staging each Hub local directory, `python -m llm_cdeq.verify_artifacts`
+checks every file against the exact revision and Hub Git/LFS etag and writes a
+machine-readable verification manifest.
+Pass the matching pinned manifest under `configs/llm_cdeq/artifacts/`; this also
+rejects missing shards, unexpected files, and wrong byte sizes. For example:
+
+```bash
+python -m llm_cdeq.verify_artifacts \
+  --root /home/ljc/models/cllm/Abel-7B-001 \
+  --revision 3439c5a654dac2320d228d11a0c5590346e81d1a \
+  --manifest configs/llm_cdeq/artifacts/abel-7b-001.json \
+  --output /home/ljc/experiments/cllm-cdeq/artifacts/abel-7b-001.json
+```
 
 ## Cache contract
 

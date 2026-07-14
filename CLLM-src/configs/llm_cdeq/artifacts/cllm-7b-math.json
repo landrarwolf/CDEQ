@@ -1,0 +1,24 @@
+{
+  "schema_version": "llm_cdeq_artifact_manifest_v1",
+  "repo_id": "cllm/consistency-llm-7b-math",
+  "repo_type": "model",
+  "revision": "904a1eefdf8e33a3440ddea35a55dd75cead648c",
+  "files": [
+    {"path": ".gitattributes", "size": 1519, "etag": "a6344aac8c09253b3b630fb776ae94478aa0275b"},
+    {"path": "README.md", "size": 301, "etag": "d04cc874d6f542fd9e70b8d931f07da396419a92"},
+    {"path": "added_tokens.json", "size": 920, "etag": "d8645073aa05f14530024f5d4c42076b4830aaa9"},
+    {"path": "config.json", "size": 716, "etag": "d2fc26ea958b94b320b71a9ea232651085188720"},
+    {"path": "generation_config.json", "size": 132, "etag": "472953df10525a52c3c618c0466b96562287d1b5"},
+    {"path": "optimizer.bin", "size": 9502720, "etag": "d7cc06f46e9fd3a6369ab64312d8dbed4f9f4bff0b7fd77330987a877daf8a21"},
+    {"path": "pytorch_model.bin", "size": 13477502757, "etag": "1159bb6bd9087b22d8538e43029c8bda731f07bcc69b558fc2686ed50381e00a"},
+    {"path": "rng_state_0.pth", "size": 18615, "etag": "05381902e050f0f074a164b867a506fcd81522ddf2592cfa7de8975646ff6879"},
+    {"path": "rng_state_1.pth", "size": 18615, "etag": "dda3beb35ea15a8d0c0ed53cff8d5109c6ee745e6e3a5c76ac92d6f3eff443af"},
+    {"path": "rng_state_3.pth", "size": 18615, "etag": "a9f2f4de4cb055635f93bb883c7c0dea8ef72d249f110e357498f653147b3217"},
+    {"path": "rng_state_4.pth", "size": 18615, "etag": "ac5de269cbe8f1dbaa613325bf6f6ae658e9f3df918f4f4f0f7bb511ccf60199"},
+    {"path": "scheduler.pt", "size": 627, "etag": "9fe772996d34cd0af1e4af71b13bc857284fb5b8ba95c3e312a9ae8ee8aa2af6"},
+    {"path": "special_tokens_map.json", "size": 549, "etag": "a350096e4c7814fbd60e37d492f988b80f53dd66"},
+    {"path": "tokenizer.model", "size": 499723, "etag": "9e556afd44213b6bd1be2b850ebbbd98f5481437a8021afaf58ee7fb1818d347"},
+    {"path": "tokenizer_config.json", "size": 6746, "etag": "ef579f8940f8c44481367f61686aadd51010abee"},
+    {"path": "training_args.bin", "size": 4795, "etag": "3c3bfd3a5bf7a505bb8876696601fbebfd787165ba58df496bd0cb028f48ae34"}
+  ]
+}

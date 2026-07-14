@@ -149,6 +149,7 @@ def generate_cdeq(
         torch.cuda.synchronize(device)
     target_seconds += time.perf_counter() - target_start
     population = input_ids[0].tolist()
+    eos_reached = False
     while sum(block.numel() for block in generated) < max_new_tokens:
         random_tokens = torch.tensor(
             rng.choices(population, k=block_size - 1), device=device, dtype=torch.long
@@ -179,6 +180,7 @@ def generate_cdeq(
         adapter_seconds += time.perf_counter() - adapter_start
         eos = torch.where(endpoint_tokens.eq(tokenizer.eos_token_id))[0]
         if len(eos):
+            eos_reached = True
             generated.append(endpoint_tokens[: int(eos[0]) + 1].cpu())
             break
         generated.append(endpoint_tokens.cpu())
@@ -197,10 +199,23 @@ def generate_cdeq(
             torch.cuda.synchronize(device)
         target_seconds += time.perf_counter() - target_start
     output = torch.cat(generated)[:max_new_tokens]
+    longest_repeat = 1
+    current_repeat = 1
+    for index in range(1, output.numel()):
+        if output[index] == output[index - 1]:
+            current_repeat += 1
+            longest_repeat = max(longest_repeat, current_repeat)
+        else:
+            current_repeat = 1
     return output, {
         "adapter_seconds": adapter_seconds,
         "target_seconds": target_seconds,
         "generated_tokens": int(output.numel()),
+        "eos_reached_samples": int(eos_reached),
+        "eos_first_token_samples": int(
+            output.numel() > 0 and output[0] == tokenizer.eos_token_id
+        ),
+        "repetitive_samples": int(longest_repeat >= 10),
     }
 
 
@@ -319,7 +334,15 @@ def main() -> None:
         questions = load_gsm8k_questions(test_path, limit)
         output_file = Path(args.output_file) if args.output_file else output_root / "cdeq_gsm8k.jsonl"
         output_file.parent.mkdir(parents=True, exist_ok=True)
-        timing = {"adapter_seconds": 0.0, "target_seconds": 0.0, "generated_tokens": 0}
+        timing = {
+            "adapter_seconds": 0.0,
+            "target_seconds": 0.0,
+            "generated_tokens": 0,
+            "eos_reached_samples": 0,
+            "eos_first_token_samples": 0,
+            "repetitive_samples": 0,
+            "empty_decoded_samples": 0,
+        }
         rng = random.Random(seed)
         with output_file.open("w", encoding="utf-8") as handle:
             for index, question in enumerate(tqdm(questions, desc="GSM8K CDEQ")):
@@ -334,6 +357,7 @@ def main() -> None:
                     rng=rng,
                 )
                 response = tokenizer.decode(tokens, skip_special_tokens=True).strip()
+                timing["empty_decoded_samples"] += int(not response)
                 handle.write(
                     json.dumps(
                         {"id": index, "prompt": prompt, "response": response},

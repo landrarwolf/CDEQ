@@ -459,6 +459,22 @@ def main() -> None:
     train_limit = args.train_limit or len(train_data)
     validation_limit = args.validation_limit or len(validation_data)
     accumulation = int(training["gradient_accumulation"])
+    initial_metrics = None
+    initial_metrics_path = output_dir / "initial_metrics.json"
+    if start_epoch == 0:
+        initial_metrics = evaluate_cache(
+            adapter,
+            validation_data,
+            lm_head,
+            device=device,
+            batch_size=int(training["batch_size"]),
+            limit=validation_limit,
+        )
+        initial_metrics_path.write_text(
+            json.dumps(initial_metrics.__dict__, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        print(json.dumps({"initial_validation": initial_metrics.__dict__}, sort_keys=True))
     optimizer.zero_grad(set_to_none=True)
     for epoch in range(start_epoch, int(training["epochs"])):
         adapter.train()
@@ -575,6 +591,15 @@ def main() -> None:
         "trainable_fraction": trainable_parameter_count(adapter) / backbone_count,
         "data_split_hash": train_data.manifest["data_split_hash"],
         "history_sha256": stable_hash(history_path.read_text(encoding="utf-8")),
+        "initial_validation_metrics": (
+            initial_metrics.__dict__
+            if initial_metrics is not None
+            else (
+                json.loads(initial_metrics_path.read_text(encoding="utf-8"))
+                if initial_metrics_path.exists()
+                else None
+            )
+        ),
     }
     (output_dir / "run_manifest.json").write_text(
         json.dumps(run_manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"

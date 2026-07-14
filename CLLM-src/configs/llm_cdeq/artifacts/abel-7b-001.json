@@ -1,0 +1,19 @@
+{
+  "schema_version": "llm_cdeq_artifact_manifest_v1",
+  "repo_id": "GAIR/Abel-7B-001",
+  "repo_type": "model",
+  "revision": "3439c5a654dac2320d228d11a0c5590346e81d1a",
+  "files": [
+    {"path": ".gitattributes", "size": 1519, "etag": "a6344aac8c09253b3b630fb776ae94478aa0275b"},
+    {"path": "added_tokens.json", "size": 920, "etag": "d8645073aa05f14530024f5d4c42076b4830aaa9"},
+    {"path": "config.json", "size": 617, "etag": "c6faa69d4be7c741a37c9d322199ae2f6ae3d04b"},
+    {"path": "pytorch_model-00001-of-00003.bin", "size": 9878525722, "etag": "74400d14928ac9bb3219a5c76d947b9c0b86cf095e0cdc68d4a14cfdc1bd60a8"},
+    {"path": "pytorch_model-00002-of-00003.bin", "size": 9894793766, "etag": "36bf491ad0f8f850a6f0bbff4862e107a64eb77c7f55d0682671e4c824291140"},
+    {"path": "pytorch_model-00003-of-00003.bin", "size": 7181510149, "etag": "60b8958b936d62ccfa15f5d60e0be35173c2a5c34238a1192435d2ae9824903a"},
+    {"path": "pytorch_model.bin.index.json", "size": 26788, "etag": "f70751ae9d81dd7eed78356419fd3b737b90e20a"},
+    {"path": "special_tokens_map.json", "size": 435, "etag": "f928b2409a393d47ce0d9fe519f17e048a471eca"},
+    {"path": "tokenizer.json", "size": 1848997, "etag": "c4856a11bba574d20df444f8106756103f3eab37"},
+    {"path": "tokenizer.model", "size": 499723, "etag": "9e556afd44213b6bd1be2b850ebbbd98f5481437a8021afaf58ee7fb1818d347"},
+    {"path": "tokenizer_config.json", "size": 695, "etag": "a4931dd7641c36c15d061e2e80fa7490c25ee842"}
+  ]
+}

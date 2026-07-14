@@ -10,6 +10,20 @@ from torch import nn
 CHECKPOINT_SCHEMA = "llm_cdeq_checkpoint_v1"
 
 
+class RMSNormNoAffine(nn.Module):
+    """Stateless RMSNorm compatible with the official PyTorch 2.1 runtime."""
+
+    def __init__(self, hidden_size: int, eps: float = 1e-6):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.eps = eps
+
+    def forward(self, value: torch.Tensor) -> torch.Tensor:
+        variance = value.float().pow(2).mean(dim=-1, keepdim=True)
+        normalized = value.float() * torch.rsqrt(variance + self.eps)
+        return normalized.to(dtype=value.dtype)
+
+
 class ResidualMLP(nn.Module):
     def __init__(self, input_size: int, hidden_size: int, output_size: int):
         super().__init__()
@@ -26,7 +40,7 @@ class ResidualMLP(nn.Module):
 class InitialStatePredictor(nn.Module):
     def __init__(self, hidden_size: int, rank: int, multiplier: int = 3):
         super().__init__()
-        self.norm = nn.RMSNorm(hidden_size, elementwise_affine=False)
+        self.norm = RMSNormNoAffine(hidden_size)
         self.down = nn.Linear(hidden_size, rank, bias=False)
         self.mlp = ResidualMLP(rank, multiplier * rank, rank)
         self.up = nn.Linear(rank, hidden_size, bias=False)
@@ -54,7 +68,7 @@ class CDEQAdapter(nn.Module):
         self.hidden_size = hidden_size
         self.rank = rank
         self.terminal = float(terminal)
-        self.norm = nn.RMSNorm(hidden_size, elementwise_affine=False)
+        self.norm = RMSNormNoAffine(hidden_size)
         self.down = nn.Linear(hidden_size, rank, bias=False)
         self.updater = ResidualMLP(rank + 1, multiplier * rank, rank)
         self.up = nn.Linear(rank, hidden_size, bias=False)
@@ -149,4 +163,3 @@ class AdapterMetrics:
     token_agreement: float
     exact_block_match: float
     examples: int
-
