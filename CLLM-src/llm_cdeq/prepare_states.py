@@ -14,12 +14,61 @@ from tqdm import tqdm
 
 from .cache import CACHE_SCHEMA, write_manifest, write_shard
 from .config import config_digest, load_config, public_config, resolve_repo_path
-from .runtime import eos_mask, iter_json_array, split_for_data_id, stable_hash, unbatch_ids
+from .runtime import eos_mask, iter_json_array, stable_hash, unbatch_ids
 from .time import rho_time_grid
 
 
 class HiddenTokenAlignmentError(ValueError):
     pass
+
+
+def plan_grouped_split(
+    group_counts: dict[str, int],
+    *,
+    seed: int,
+    validation_fraction: float,
+    validation_minimum: int,
+) -> tuple[dict[str, str], dict[str, int]]:
+    """Assign complete data-id groups while meeting a record-level validation target."""
+    if not group_counts or not 0 < validation_fraction < 1:
+        raise ValueError("group counts must be non-empty and validation fraction in (0, 1)")
+    if validation_minimum < 1:
+        raise ValueError("validation minimum must be positive")
+    total = sum(int(count) for count in group_counts.values())
+    target = max(validation_minimum, round(total * validation_fraction))
+    if target >= total:
+        raise ValueError("validation target leaves no training records")
+    ordered = sorted(
+        group_counts,
+        key=lambda data_id: hashlib.sha256(f"{seed}:{data_id}".encode("utf-8")).digest(),
+    )
+    validation_ids: set[str] = set()
+    validation_records = 0
+    deferred: list[str] = []
+    for data_id in ordered:
+        count = int(group_counts[data_id])
+        if validation_records + count <= target:
+            validation_ids.add(data_id)
+            validation_records += count
+        else:
+            deferred.append(data_id)
+    if validation_records < target:
+        data_id = min(deferred, key=lambda value: int(group_counts[value]))
+        validation_ids.add(data_id)
+        validation_records += int(group_counts[data_id])
+    assignment = {
+        data_id: "validation" if data_id in validation_ids else "train"
+        for data_id in group_counts
+    }
+    return assignment, {
+        "total_records": total,
+        "train_records": total - validation_records,
+        "validation_records": validation_records,
+        "train_groups": len(group_counts) - len(validation_ids),
+        "validation_groups": len(validation_ids),
+        "validation_target": target,
+        "validation_overshoot": validation_records - target,
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -307,6 +356,21 @@ def main() -> None:
         {"weight": model.lm_head.weight.detach().to(torch.bfloat16).cpu().contiguous()},
         str(cache_root / "lm_head.safetensors"),
     )
+    group_counts: Counter[str] = Counter()
+    for raw in tqdm(iter_json_array(source), desc="index data-id groups"):
+        data_id = raw.get("data_id")
+        if data_id is None:
+            raise ValueError("trajectory record is missing data_id")
+        group_counts[str(data_id)] += 1
+    data_split, split_plan = plan_grouped_split(
+        dict(group_counts),
+        seed=int(training["seed"]),
+        validation_fraction=validation_fraction,
+        validation_minimum=validation_limit,
+    )
+    if split_plan["train_records"] < train_limit:
+        raise ValueError(f"grouped split has too few training records: {split_plan}")
+
     writers = {
         split: SplitWriter(cache_root, split, int(training["shard_size"]))
         for split in ("train", "validation")
@@ -314,14 +378,10 @@ def main() -> None:
     limits = {"train": train_limit, "validation": validation_limit}
     accepted = Counter()
     rejected = Counter()
-    data_split: dict[str, str] = {}
     progress = tqdm(total=train_limit + validation_limit, desc="aligned blocks")
     for raw in iter_json_array(source):
-        data_id = str(raw.get("data_id"))
-        split = data_split.setdefault(
-            data_id,
-            split_for_data_id(data_id, int(training["seed"]), validation_fraction),
-        )
+        data_id = str(raw["data_id"])
+        split = data_split[data_id]
         if accepted[split] >= limits[split]:
             if all(accepted[name] >= limit for name, limit in limits.items()):
                 break
@@ -371,6 +431,7 @@ def main() -> None:
         "dtype": "bfloat16",
         "strict_alignment": bool(args.strict_alignment),
         "rejected": dict(rejected),
+        "split_plan": split_plan,
         "lm_head_file": "../lm_head.safetensors",
         "backbone_parameter_count": sum(parameter.numel() for parameter in model.parameters()),
     }
@@ -379,6 +440,7 @@ def main() -> None:
         "accepted": dict(accepted),
         "rejected": dict(rejected),
         "data_split_hash": split_hash,
+        "split_plan": split_plan,
         "manifests": manifests,
     }
     (cache_root / "prepare_summary.json").write_text(

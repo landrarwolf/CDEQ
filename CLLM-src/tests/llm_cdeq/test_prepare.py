@@ -2,6 +2,7 @@ import torch
 
 from llm_cdeq.prepare_states import (
     deduplicate_token_states,
+    plan_grouped_split,
     recover_aligned_chain,
     shifted_hidden_slice,
 )
@@ -30,3 +31,27 @@ def test_interleaved_augmented_states_recover_longest_jacobi_chain():
 def test_deduplication_ignores_tokens_after_eos():
     states = deduplicate_token_states([[1, 9, 2], [1, 9, 7], [1, 8, 2]], eos_token_id=9)
     assert states.tolist() == [[1, 9, 2], [1, 8, 2]]
+
+
+def test_grouped_split_meets_record_target_without_leaking_groups():
+    counts = {"large": 90, **{f"small-{index}": 1 for index in range(30)}}
+    assignment, summary = plan_grouped_split(
+        counts,
+        seed=42,
+        validation_fraction=0.1,
+        validation_minimum=12,
+    )
+    assert summary["validation_records"] >= 12
+    assert summary["validation_overshoot"] == 0
+    assert assignment["large"] == "train"
+    assert summary["train_records"] + summary["validation_records"] == 120
+    assert set(assignment) == set(counts)
+    assert set(assignment.values()) == {"train", "validation"}
+    repeated, repeated_summary = plan_grouped_split(
+        counts,
+        seed=42,
+        validation_fraction=0.1,
+        validation_minimum=12,
+    )
+    assert repeated == assignment
+    assert repeated_summary == summary
