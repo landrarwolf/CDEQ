@@ -94,6 +94,19 @@ python -m llm_cdeq.verify_artifacts \
   --output /home/ljc/experiments/cllm-cdeq/artifacts/abel-7b-001.json
 ```
 
+The resumable local-to-remote artifact queue can run in a detached
+`cllm-artifacts` screen session. Its status command is safe to run repeatedly:
+
+```bash
+bash /Users/landrarwolf/Documents/CDEQ/CLLM-src/scripts/cllm_artifact_status.sh
+```
+
+The queue downloads one Abel shard at a time to respect local disk limits,
+checks the pinned size and SHA-256, retries interrupted rsync transfers, verifies
+the remote digest, and only then removes the local temporary weight. It writes
+`/private/tmp/cllm-stage/download.done` only after both complete model manifests
+pass on the remote server.
+
 ## Cache contract
 
 `prepare_states` converts every token state `y^(k)` to the frozen Abel final
