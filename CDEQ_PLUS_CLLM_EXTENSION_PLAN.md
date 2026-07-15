@@ -137,6 +137,20 @@ progress 置信度、连续 greedy token 稳定性和 masked hidden update norm�
 作为稳健性 fallback/消融。后者每轮会增加一次 backbone forward，必须单独报告
 target-backbone NFE，只有在平均调用数仍远低于 CLLM 时才可作为最终方案。
 
+## 0.3 Adaptive Stage A 实际结果
+
+连续轨迹 oracle projector 和 1/2/3/4-call latent recurrence 已实现，并在当前 2k
+tuned checkpoint 与严格匹配的 512-block validation cache 上完成验证。结果未通过
+oracle gate：endpoint hidden error 从 call 1 的 `0.859063` 逐步恶化到 call 4 的
+`0.870933`，token agreement 维持在约 `45.25%`，没有实质提升。
+
+第一次输出的平均连续轨迹投影进度仅为 `0.027146`，projection distance 为
+`0.500858`；重复调用后进度仍停留在约 `0.03`，而 distance 增至 `0.563718`。训练
+split 上得到同方向结果，因此当前失败不是 learned-time 估计误差，而是 updater 输出
+off-trajectory 且不具备稳定 self-composition。按 gate 规则，暂不训练 progress head，
+不启用 rollout loss，也不升级 checkpoint；完整诊断见
+[`ADAPTIVE_CDEQ_PLUS_RESEARCH_IDEA.md`](ADAPTIVE_CDEQ_PLUS_RESEARCH_IDEA.md)。
+
 ## 1. 最终决策
 
 LLM 部分应定位为 **CDEQ+ 的跨领域应用验证**，而不是一篇新的并行解码方法。
@@ -807,9 +821,9 @@ Section 7 建议篇幅：
 - [ ] 保存 deterministic Jacobi trajectories。
 - [ ] 训练 CDEQ-Jacobi baseline。
 - [ ] 训练全部四组 Init/CT ablation。
-- [ ] 运行 oracle-time 1/2/3/4-call recurrence gate。
-- [ ] 训练并校准 progress estimator。
-- [ ] 仅在 rollout gap 出现时加入 detached rollout augmentation。
+- [x] 运行 oracle-time 1/2/3/4-call recurrence gate（未通过）。
+- [ ] 训练并校准 progress estimator（因 oracle gate 失败而暂停）。
+- [ ] 仅在 rollout gap 出现时加入 detached rollout augmentation（当前不启用）。
 - [ ] 在相同协议下运行 CLLM。
 - [ ] 加入第二个任务。
 
@@ -819,7 +833,7 @@ Section 7 建议篇幅：
 - [ ] 报告 wall-clock latency 和 TPS。
 - [ ] 报告 NFE/Jacobi iterations。
 - [ ] 报告平均/median/P95 calls、停止原因和 learned-time/oracle-time gap。
-- [ ] 报告每轮 output-to-trajectory distance 与 endpoint 改善曲线。
+- [x] 报告每轮 output-to-trajectory distance 与 endpoint 变化曲线（Stage A）。
 - [ ] 报告 trainable parameters 和 training memory。
 - [ ] 绘制 trajectory distance 与 token agreement。
 - [ ] 确认性能差异不是来自不同 decoding budget。

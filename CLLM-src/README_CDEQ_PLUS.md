@@ -72,6 +72,25 @@ python -m llm_cdeq.profile \
   --checkpoint /home/ljc/experiments/cllm-cdeq/init1_ct1_seed42/best.pt
 ```
 
+The Stage-A adaptive hypothesis has a separate cache-only oracle diagnostic:
+
+```bash
+python -m llm_cdeq.adaptive \
+  --config configs/llm_cdeq/gsm8k.yaml \
+  --checkpoint /home/ljc/experiments/cllm-cdeq/halving-phase1/\
+r512_lr0.001_l0.2/init0_ct0_seed42/best.pt \
+  --split validation --sample-limit 512 --max-calls 4 --weights ema \
+  --output-file /home/ljc/experiments/cllm-cdeq/adaptive-oracle/2k-best.json
+```
+
+It continuously projects each student state onto the piecewise-linear teacher
+trajectory and reports per-call endpoint error, token agreement, projection
+progress/distance, call counts, and stop reasons. Split-hash mismatches are a
+hard error unless `--allow-split-mismatch` explicitly marks a diagnostic smoke
+run. The matched 512-block gate failed: calls 2--4 moved farther from the
+endpoint and teacher trajectory, so progress-head and rollout training remain
+disabled rather than being added to the existing checkpoint/training path.
+
 The official reproduction suite is:
 
 ```bash
@@ -195,7 +214,8 @@ python -m py_compile llm_cdeq/*.py
 
 Tests cover time-grid endpoints, continuous interpolation, progressive pair
 ordering, EOS masks, hidden shift, exact `t=T` identity, initializer detach,
-EMA, parameter budget, safetensors manifests, and checkpoint round-trip.
+EMA, parameter budget, safetensors manifests, checkpoint round-trip, continuous
+oracle projection, per-example adaptive stopping, and identity-boundary caps.
 
 ## Current feasibility result
 

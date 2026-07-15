@@ -378,7 +378,47 @@ CLLM-src/llm_cdeq/profile.py        # calls/NFE/latency Pareto
 7. 如何定义“显著少于 CLLM”：平均调用数、P95、wall-clock，还是三者同时约束？
 8. adaptive refinement 是否会改变 Init/CT 原本的消融解释？
 
-## 13. 当前结论
+## 13. Stage A 实际结果
+
+已使用与当前 balanced cache split hash 严格一致的 2k tuned checkpoint，在 512 个
+validation blocks 上完成 EMA 权重的 oracle-time 1/2/3/4-call gate：
+
+| Calls | Endpoint hidden error | Token agreement | Projection progress | Projection distance |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 0.859063 | 45.2515% | 0.027146 | 0.500858 |
+| 2 | 0.860637 | 45.3247% | 0.028609 | 0.525677 |
+| 3 | 0.865625 | 45.2759% | 0.029523 | 0.547047 |
+| 4 | 0.870933 | 45.2637% | 0.030107 | 0.563718 |
+
+正式 gate 未通过。第二次调用相对第一次的 hidden error 已开始恶化，之后继续恶化；
+token agreement 只有统计噪声量级波动。更关键的是，第一次输出投影到教师连续轨迹的
+平均进度只有 0.027，而不是设想中的中间轨迹区域，且每次重复调用后投影距离持续增大。
+
+同一 checkpoint 在 512 个 training blocks 上也得到相同方向：hidden error 从
+`0.834737` 依次变为 `0.835719 / 0.840409 / 0.845639`，projection distance 从
+`0.484739` 增至 `0.547883`。这排除了“只在 held-out split 上偶然失败”的解释。
+使用 online 权重重复 validation gate 也未通过：hidden error 从 `0.860156` 恶化到
+`0.872973`，因此结论不依赖选择 EMA 或 online checkpoint 权重。
+
+另用旧 64-block CT overfit checkpoint 做了 split-mismatch smoke；由于原 cache 已被
+重建覆盖，该结果不能作为正式证据，但同样呈现重复调用恶化，因此不改变正式结论。
+
+当前证据说明：现有 updater 的单步输出是明显的 off-trajectory state，all-states-to-
+endpoint regression 并没有自动产生可自组合的轨迹动力学。此时训练 progress head
+只会学到接近起点的时间坐标，不能解决核心问题。按预注册顺序，Stage B progress
+training 和 Stage C rollout training 均暂停，不升级 checkpoint schema，也不修改现有
+adapter 主训练入口。
+
+远端原始报告保存在：
+
+```text
+/home/ljc/experiments/cllm-cdeq/adaptive-oracle/2k-best.json
+/home/ljc/experiments/cllm-cdeq/adaptive-oracle/2k-best-train512.json
+/home/ljc/experiments/cllm-cdeq/adaptive-oracle/2k-best-online.json
+/home/ljc/experiments/cllm-cdeq/adaptive-oracle/overfit64-ct-mismatch-smoke.json
+```
+
+## 14. 当前结论
 
 现阶段最合理的判断是：
 
@@ -390,4 +430,7 @@ CLLM-src/llm_cdeq/profile.py        # calls/NFE/latency Pareto
 - 研究目标从“严格一步到 endpoint”调整为“用显著少于 CLLM 的少量自适应调用达到
   更好的 quality/latency Pareto”。
 
-因此下一步不是立即重训，而是先实现 Stage A 的 oracle 1/2/3/4-call gate。
+Stage A 已实现并得到负结果。下一步需要在两条研究路线中重新选择：先增强 one-shot
+endpoint predictor，使其输出真正落到教师轨迹邻域；或显式增加 self-composition/
+manifold-constrained training。后者会改变原已确认的最小训练方案，实施前需要重新
+讨论损失定义和消融公平性。
