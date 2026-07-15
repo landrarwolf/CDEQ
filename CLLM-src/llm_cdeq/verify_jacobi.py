@@ -8,17 +8,45 @@ from pathlib import Path
 import torch
 from tqdm import tqdm
 from transformers import AutoTokenizer, LlamaForCausalLM
-from transformers.cache_utils import DynamicCache
-
-from cllm.cllm_llama_modeling import delete_false_key_value, jacobi_forward
 
 from .config import load_config, resolve_repo_path
 from .evaluate import PROMPT, load_gsm8k_questions
 from .runtime import seed_everything
 
 
-DynamicCache.delete_false_key_value = delete_false_key_value
-LlamaForCausalLM.jacobi_forward = jacobi_forward
+def greedy_ar_block(
+    model: LlamaForCausalLM, prefix: torch.Tensor, block_size: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Generate one greedy block with the same no-cache forward used by Jacobi."""
+    generated = prefix
+    block: list[torch.Tensor] = []
+    for _ in range(block_size):
+        logits = model(input_ids=generated, use_cache=False).logits[:, -1]
+        token = logits.argmax(dim=-1, keepdim=True)
+        block.append(token)
+        generated = torch.cat((generated, token), dim=1)
+    return generated, torch.cat(block, dim=1)
+
+
+def vanilla_jacobi_endpoint(
+    model: LlamaForCausalLM,
+    prefix: torch.Tensor,
+    initial: torch.Tensor,
+) -> tuple[torch.Tensor, int]:
+    """Iterate the full causal token block until it is an exact self-mapping."""
+    block_size = initial.shape[1]
+    prompt_length = prefix.shape[1]
+    state = initial
+    for iteration in range(1, block_size + 2):
+        full = torch.cat((prefix, state), dim=1)
+        logits = model(input_ids=full, use_cache=False).logits
+        next_state = logits[
+            :, prompt_length - 1 : prompt_length + block_size - 1
+        ].argmax(dim=-1)
+        if torch.equal(next_state, state):
+            return state, iteration
+        state = next_state
+    raise RuntimeError("vanilla Jacobi did not converge within block_size + 1 iterations")
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,36 +84,17 @@ def main() -> None:
         prefix = tokenizer(PROMPT.format(input=question), return_tensors="pt").input_ids.to(args.device)
         block_id = 0
         while checked < args.blocks:
-            ar_full = model.generate(
-                input_ids=prefix,
-                do_sample=False,
-                use_cache=True,
-                max_new_tokens=block_size,
-                pad_token_id=tokenizer.eos_token_id,
-            )
-            ar_endpoint = ar_full[:, prefix.shape[1] : prefix.shape[1] + block_size]
-            if ar_endpoint.shape[1] != block_size:
-                break
-            cache, first_token = model.jacobi_forward(
-                input_ids=prefix,
-                max_new_tokens=block_size,
-                past_key_values=None,
-                use_cache=True,
-                prefill_phase=True,
-            )
+            ar_full, ar_endpoint = greedy_ar_block(model, prefix, block_size)
             random_point = torch.tensor(
                 rng.choices(prefix[0].tolist(), k=block_size - 1),
                 device=args.device,
                 dtype=torch.long,
             ).view(1, -1)
-            initial = torch.cat((first_token.view(1, 1), random_point), dim=1)
-            jacobi_endpoint, _, iterations, accurate_length = model.jacobi_forward(
-                input_ids=initial,
-                max_new_tokens=block_size,
-                past_key_values=cache,
-                use_cache=True,
-                prefill_phase=False,
+            initial = torch.cat((ar_endpoint[:, :1], random_point), dim=1)
+            jacobi_endpoint, iterations = vanilla_jacobi_endpoint(
+                model, prefix, initial
             )
+            accurate_length = block_size
             equal = bool(torch.equal(jacobi_endpoint, ar_endpoint))
             records.append(
                 {

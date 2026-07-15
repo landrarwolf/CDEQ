@@ -184,7 +184,7 @@ feasibility gate passes.
 ## Tests
 
 ```bash
-pytest -q tests/llm_cdeq
+python -m pytest -q tests/llm_cdeq
 python -m py_compile llm_cdeq/*.py
 ```
 

@@ -10,6 +10,10 @@ import sys
 import pdb
 import random
 from math_normalization import *
+from pathlib import Path
+
+
+TEST_FILE = Path(__file__).resolve().with_name("test.jsonl")
 
 def consistency_generate(
     model,
@@ -154,7 +158,7 @@ def get_results(pred_file, dev_set):
     if dev_set in ['all', 'gsm8k', 'math', 'mathgpt', 'gsm8k_robust']:
         golds_str = []
         properties = []
-        with open(f'test.jsonl', 'r', encoding='utf-8') as f:
+        with TEST_FILE.open('r', encoding='utf-8') as f:
             for line in f:
                 if dev_set != "all":
                     if json.loads(line)['source'].lower() == dev_set:
@@ -188,7 +192,7 @@ def get_raw_inputs(dev_set):
     # in this function, we will get the raw queries for a target dev set
     data = []
     if dev_set in ['all', 'gsm8k', 'math', 'mathgpt', 'gsm8k_robust']:
-        with open(f'test.jsonl') as f:
+        with TEST_FILE.open(encoding='utf-8') as f:
             for line in jsonlines.Reader(f):
                 data.append(line)
         if dev_set != 'all':
@@ -301,7 +305,9 @@ if __name__ == '__main__':
 
         # part 5 we save the results, always be {'id':id,'response':response}
         # if dir of output file is not exist, it will be created automatically
-        with open(args.output_file_name, "w") as f:
+        output_path = Path(args.output_file_name)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open("w") as f:
             for id, output in enumerate(outputs):
             # note that `prompt`s are the wrapped ones
                 f.write(json.dumps({'id': id, 'prompt': output['prompt'], 'response': output['answer']}) + '\n')
