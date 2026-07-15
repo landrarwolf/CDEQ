@@ -1,10 +1,23 @@
 # CDEQ+-Jacobi on CLLM/GSM8K
 
 This directory keeps the official CLLM source at upstream commit
-`22775363f8563c63620e71f7a204e90a51d6a379`. The isolated implementation in
-`llm_cdeq/` freezes Abel-7B and its LM head, distills continuous Jacobi hidden
-trajectories into a one-step bottleneck adapter, and supports the four
-`Init × CT` ablations. It does not change the existing CDEQ entrypoint.
+`22775363f8563c63620e71f7a204e90a51d6a379`. The active implementation freezes
+the official `cllm/consistency-llm-7b-math` checkpoint and executes, on every
+refinement round:
+
+```text
+current tokens
+  -> full official CLLM forward
+  -> canonical shifted hidden
+  -> causal Transformer residual corrector
+  -> frozen official LM head
+  -> next tokens
+```
+
+The next round always sends those tokens through the complete official CLLM
+backbone again. The old Abel-cache/tokenwise-MLP implementation remains readable
+only as a `legacy/failed diagnostic`; it is not a valid wrapped CLLM operator.
+Neither path changes the original DEQ/CDEQ entrypoint.
 
 ## Pinned inputs
 
@@ -51,6 +64,25 @@ module and pip 26 misclassifies the official Ninja wheel on the target host.
 ## Stable CLI
 
 Run all commands from `CLLM-src/`:
+
+Active official-CLLM wrapped gate:
+
+```bash
+python -m llm_cdeq.prepare_cllm_states \
+  --config configs/llm_cdeq/gsm8k_wrapped_cllm.yaml \
+  --limit 64 --device cuda --attention-backend sdpa
+
+python -m llm_cdeq.train_wrapped \
+  --config configs/llm_cdeq/gsm8k_wrapped_cllm.yaml \
+  --init 0 --ct 0 --device cuda
+```
+
+`train_wrapped` is hard-capped at 200 optimizer steps by the config. It rejects
+Init/CT until the base wrapped gate passes, rejects the legacy Abel cache schema,
+and never loads Abel as a fallback operator.
+
+The following commands are preserved only for reproducing the failed MLP-only
+diagnostic and its checkpoints:
 
 ```bash
 python -m llm_cdeq.prepare_states --config configs/llm_cdeq/gsm8k.yaml
@@ -126,7 +158,25 @@ the remote digest, and only then removes the local temporary weight. It writes
 `/private/tmp/cllm-stage/download.done` only after both complete model manifests
 pass on the remote server.
 
-## Cache contract
+## Active official CLLM cache contract
+
+`prepare_cllm_states` reuses only each GSM8K prompt, `data_id`, and deterministic
+initial `y0`. Starting from `y0`, it repeatedly runs the full official CLLM
+single-step operator until token fixed point. Each state stores:
+
+- `canonical_hidden [N,K,16,4096]` in BF16;
+- official input/output token blocks and their state/EOS masks;
+- endpoint hidden/tokens and the per-trajectory rho time grid;
+- official CLLM/tokenizer revisions and attention backend;
+- shard, LM-head, data-split, and full backbone checksums.
+
+`LMHead(canonical_hidden)` must match the official Jacobi-shifted tokens at every
+valid state. The schema is
+`llm_cdeq_official_cllm_hidden_cache_v1`, under
+`/home/ljc/data/cllm/hidden_state_cache/gsm8k_official_cllm_v1`; the wrapped
+trainer refuses the legacy Abel schema.
+
+## Legacy Abel cache contract
 
 `prepare_states` converts every token state `y^(k)` to the frozen Abel final
 hidden slice
@@ -164,7 +214,35 @@ hash, shard counts, alignment rejection counts, and metadata JSONL. The frozen
 LM-head weight is cached once outside the shards so adapter training never
 loads the 7B backbone.
 
-## Model and checkpoint contract
+## Active wrapped model and checkpoint contract
+
+The active residual corrector is:
+
+```text
+4096 -> 512
+  + learned time embedding
+  + learned 16-position embedding
+  + 1 causal self-attention block (8 heads)
+  + FFN 512 -> 2048 -> 512
+512 -> 4096 (zero initialized)
+```
+
+For the official CLLM single-step hidden `b`, it computes
+`A(b,t)=b+(1-t/T)Delta(b,t)`. Both the corrector and wrapper explicitly bypass
+all adapter work at `t=T`, and `disable_adapter` bypasses initializer and
+corrector. The block's first hidden position is preserved because its token is
+already fixed by prompt prefill. The initializer, when later enabled, may run
+only at round zero and is detached before the corrector.
+
+The short-gate objective is
+`0.1 L_local + 0.9 L_endpoint + 0.1 L_safe + 0.05 L_token`, with
+`safe_margin=0`. Wrapped checkpoints use
+`llm_cdeq_wrapped_checkpoint_v1` and include corrector/EMA/optimizer weights,
+the full config, split hash, parameter counts, best metrics, and backbone
+checksums. The official backbone and LM head are frozen and absent from the
+optimizer.
+
+## Legacy MLP checkpoint contract
 
 The default adapter uses `4096 → 512`, a tokenwise `(512+1) → 1536 → 512`
 updater, and `512 → 4096`. Its output is
@@ -184,7 +262,7 @@ and EMA weights, both optimizer states, full config and upstream revisions,
 data split hash, parameter count, epoch/global step, and best validation
 metrics. Evaluation refuses upstream or data-split mismatches.
 
-## Staged experiment commands
+## Legacy staged experiment commands
 
 First, overfit 64 blocks for all variants:
 
@@ -212,12 +290,33 @@ python -m pytest -q tests/llm_cdeq
 python -m py_compile llm_cdeq/*.py
 ```
 
-Tests cover time-grid endpoints, continuous interpolation, progressive pair
-ordering, EOS masks, hidden shift, exact `t=T` identity, initializer detach,
-EMA, parameter budget, safetensors manifests, checkpoint round-trip, continuous
-oracle projection, per-example adaptive stopping, and identity-boundary caps.
+Tests additionally cover the official single-step canonical shift, immutable
+prompt KV cache, zero/terminal/disable exact equivalence, per-round backbone NFE,
+first-round-only initializer behavior, causal block interaction, official-cache
+schema isolation, wrapped checkpoint round-trip, safe/token losses, and full
+official-backbone checksum preservation. The 7B integration test is opt-in with
+`RUN_OFFICIAL_CLLM_TESTS=1`; the checksum variant also sets
+`RUN_FULL_BACKBONE_CHECKSUM=1`.
 
 ## Current feasibility result
+
+The active official-CLLM 64-block gate passed on 2026-07-15 with SDPA:
+
+- official cache alignment: 100%, 64/64 accepted, trajectory length 3--8;
+- zero residual, `t=T`, and `disable_adapter`: exact official-step equality;
+- endpoint relative error: `1.212116 -> 0.890527` (26.53% improvement);
+- endpoint token agreement: `66.8945% -> 83.6914%`;
+- samplewise safe violation, EOS collapse, repeated-block collapse: all 0%;
+- corrector: 7,616,512 parameters, 0.1130% of the 6,738,677,760-parameter
+  official CLLM backbone;
+- full official backbone checksum before/after the freeze test:
+  `2d7c82daaa9ddd454712f4a44b1e07027f03e61fb5ee82da2d46cb3b6e4ed1fb`.
+
+The run stopped at the planned 200 steps. It did not start 2k/512 training or
+adaptive progress-head work. See
+[`reports/WRAPPED_CLLM_64_GATE.md`](reports/WRAPPED_CLLM_64_GATE.md).
+
+For historical context, the legacy MLP-only feasibility result was negative:
 
 The first preregistered 2k/512 run did not pass the baseline gate after the full
 rank/LR/loss-weight search, so the 10k/1k four-way ablation was not started.

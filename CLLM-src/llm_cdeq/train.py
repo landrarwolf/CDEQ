@@ -27,6 +27,9 @@ from .runtime import move_batch, seed_everything, stable_hash
 from .time import sample_continuous_pair
 
 
+LEGACY_MLP_ONLY_DIAGNOSTIC = True
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the CDEQ-Jacobi adapter")
     parser.add_argument("--config", required=True)

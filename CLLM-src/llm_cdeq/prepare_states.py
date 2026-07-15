@@ -18,6 +18,9 @@ from .runtime import eos_mask, iter_json_array, stable_hash, unbatch_ids
 from .time import rho_time_grid
 
 
+LEGACY_ABEL_CACHE_DIAGNOSTIC = True
+
+
 class HiddenTokenAlignmentError(ValueError):
     pass
 

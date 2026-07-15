@@ -1,5 +1,11 @@
 # 轨迹进度感知的自适应 CDEQ+：研究设想与验证计划
 
+> 2026-07-15 架构更正：本文中“adapter-only latent recurrence”仅保留为失败诊断，
+> 不再是有效候选。正式 adaptive 路径的每一轮必须执行
+> `official CLLM forward -> canonical hidden -> CDEQ+ corrector -> LM head`。
+> progress head 与 adaptive rollout 在基础 wrapped operator 通过后仍保持暂停，未经
+> 新一轮计划确认不得启动。
+
 > 文档性质：待验证的研究 idea，不代表当前 CDEQ+ 已经成功。
 >
 > 当前基线：官方 CLLM 已跑通；现有 CDEQ+-Jacobi feasibility 未通过预设门槛。
@@ -201,7 +207,7 @@ learned-time 稳定优于 fixed schedule，才能说明轨迹进度感知本身�
 
 ## 7. 两种推理路径
 
-### 7.1 Adapter-only latent recurrence
+### 7.1 Adapter-only latent recurrence（legacy/failed diagnostic）
 
 直接将 `z_m` 送回轻量 updater：
 
@@ -221,15 +227,19 @@ z_(m+1) = F_theta(z_m, t_hat_m).
 - hidden error 可能下降但 token 质量不改善；
 - 重复调用可能过冲、震荡或 collapse。
 
-该路径应作为第一候选，但必须通过 output-to-trajectory distance 和多步单调性验证。
+该路径的 Stage A 已失败，并且其基础架构不包含 official CLLM 单步。禁止继续训练该
+recurrence 或 progress head；代码只为复现实验失败而保留。
 
-### 7.2 Canonical re-encoding fallback
+### 7.2 Official CLLM canonical re-encoding（唯一有效基础路径）
 
-每轮把预测 hidden 经 LM head 解码为 greedy tokens，再由冻结 Abel 重新编码成
-canonical shifted hidden，之后调用 updater。
+每轮把 corrector hidden 经 official LM head 解码为 greedy tokens，再由冻结的
+`cllm/consistency-llm-7b-math` 完整执行一次官方 Jacobi/CLLM forward，产生新的
+canonical shifted hidden，之后再调用 corrector。Abel 只保留为 AR/vanilla-Jacobi
+参考，不能成为 wrapped operator。
 
-优点：每一轮都重新投回目标 LLM 的有效 representation manifold。缺点是每轮增加一次
-backbone forward。必须将 target-backbone NFE、adapter NFE 和 wall-clock 分开报告。
+这是修正后的基础算子，不再是可选 fallback。每一轮固定为 CLLM backbone NFE=1、
+corrector NFE=1；必须将 prompt prefill、CLLM NFE、corrector NFE 和 wall-clock 分开
+报告。效率只能来自所需轮数 `M` 显著小于标准 CLLM 的轮数 `N`。
 
 只有当所需轮数仍显著少于常规 CLLM，并且质量收益明显时，该路径才可作为最终方案；
 否则仅作为诊断和消融。

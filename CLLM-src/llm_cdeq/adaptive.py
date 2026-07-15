@@ -11,6 +11,9 @@ import torch
 import torch.nn.functional as F
 
 
+LEGACY_MLP_ONLY_DIAGNOSTIC = True
+
+
 class AdaptiveAdapter(Protocol):
     """The small part of :class:`CDEQAdapter` needed by Stage A."""
 

@@ -35,10 +35,17 @@ def validate_config(config: Mapping[str, Any]) -> None:
     model = config["model"]
     time = config["time"]
     training = config["training"]
-    if int(model["hidden_size"]) <= 0 or int(model["bottleneck_rank"]) <= 0:
-        raise ValueError("hidden_size and bottleneck_rank must be positive")
+    rank_key = "corrector_rank" if model.get("operator") == "official_cllm" else "bottleneck_rank"
+    if int(model["hidden_size"]) <= 0 or int(model[rank_key]) <= 0:
+        raise ValueError(f"hidden_size and {rank_key} must be positive")
     if int(model["block_size"]) <= 0:
         raise ValueError("block_size must be positive")
+    if model.get("operator") == "official_cllm":
+        if model.get("cache_schema") != "llm_cdeq_official_cllm_hidden_cache_v1":
+            raise ValueError("official CLLM config must use the official hidden cache schema")
+        for key in ("corrector_layers", "corrector_heads", "corrector_ffn_size"):
+            if int(model[key]) <= 0:
+                raise ValueError(f"model.{key} must be positive")
     if not 0 < float(time["epsilon"]) < float(time["terminal"]):
         raise ValueError("time must satisfy 0 < epsilon < terminal")
     if float(time["rho"]) <= 0 or float(time["q"]) <= 1:
@@ -70,4 +77,3 @@ def resolve_repo_path(config: Mapping[str, Any], value: str) -> Path:
         return path
     config_path = Path(str(config.get("_config_path", Path.cwd())))
     return (config_path.parent.parent.parent / path).resolve()
-

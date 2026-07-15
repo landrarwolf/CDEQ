@@ -8,6 +8,7 @@ from torch import nn
 
 
 CHECKPOINT_SCHEMA = "llm_cdeq_checkpoint_v1"
+LEGACY_MLP_ONLY_DIAGNOSTIC = True
 
 
 class RMSNormNoAffine(nn.Module):

@@ -25,6 +25,9 @@ from .runtime import move_batch, seed_everything
 from .train import build_adapter, load_checkpoint
 
 
+LEGACY_MLP_ONLY_DIAGNOSTIC = True
+
+
 PROMPT = "Question:\n{input}\nAnswer:\nLet's think step by step.\n"
 
 

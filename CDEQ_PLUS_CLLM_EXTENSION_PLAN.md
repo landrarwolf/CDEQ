@@ -2,13 +2,16 @@
 
 > 文档性质：研究路线与实现交接文档
 >
-> 更新时间：2026-07-14
+> 更新时间：2026-07-15
 >
 > 目标：将已发表的 CDEQ 扩展为 TPAMI 稿件。主要新增方法是 initializer
 > 和 continuous-time schedule；LLM/Jacobi 解码作为一个新增应用场景，
 > 用于验证 CDEQ+ 的跨领域泛化能力。
 >
 > 边界：本文档不修改、替代或中断当前并行进行的 CDEQ+ 实现和实验。
+
+> 架构更正：0.1--0.3 节保留的是 Abel hidden + MLP-only 失败诊断的历史记录；
+> 它们不再代表当前实现。当前有效基线与结果以 0.4 节为准。
 
 ## 0. 2026-07-14 执行补充与固定协议
 
@@ -132,10 +135,11 @@ progress 置信度、连续 greedy token 稳定性和 masked hidden update norm�
    stop-gradient rollout augmentation：对学生自产状态继续监督到同一 endpoint，
    不把目标改成 next point，也不跨离散 argmax 反传整条 rollout。
 
-默认优先验证只重复轻量 adapter 的 latent recurrence，以最大化相对 CLLM 的 NFE
-优势；同时将每轮 greedy token 经冻结 Abel 重新编码回 canonical hidden manifold
-作为稳健性 fallback/消融。后者每轮会增加一次 backbone forward，必须单独报告
-target-backbone NFE，只有在平均调用数仍远低于 CLLM 时才可作为最终方案。
+这一段的原始假设后来被 0.4 节的架构审计否决：不得只重复轻量 adapter，也不得用
+Abel 作为 wrapped operator。正式 adaptive 路径每轮必须把 greedy tokens 重新送入
+冻结的 official CLLM，得到新的 canonical hidden 后再调用 corrector。相对标准 CLLM
+的效率只能来自 wrapped 方法所需轮数 `M` 显著小于标准 CLLM 的轮数 `N`，并分别
+报告 CLLM backbone NFE、corrector NFE、prompt prefill 和 wall-clock。
 
 ## 0.3 Adaptive Stage A 实际结果
 
@@ -150,6 +154,73 @@ split 上得到同方向结果，因此当前失败不是 learned-time 估计误
 off-trajectory 且不具备稳定 self-composition。按 gate 规则，暂不训练 progress head，
 不启用 rollout loss，也不升级 checkpoint；完整诊断见
 [`ADAPTIVE_CDEQ_PLUS_RESEARCH_IDEA.md`](ADAPTIVE_CDEQ_PLUS_RESEARCH_IDEA.md)。
+
+## 0.4 根本架构更正：official CLLM + CDEQ+ corrector
+
+旧路径实际执行的是：
+
+```text
+Abel forward 一次 -> tokenwise MLP -> 同一 MLP 的自产 hidden -> MLP ...
+```
+
+它既没有 official CLLM checkpoint 的 forward，也没有跨 token self-attention；第二次
+调用接收 off-manifold hidden。因此旧 cache、旧 checkpoint 与 adaptive oracle 只保留
+为 `legacy/failed diagnostic`，不允许送入新 trainer。
+
+当前每轮复合算子固定为：
+
+```text
+y_m
+ -> official CLLM 完整 forward J_phi(x,y_m)
+ -> canonical shifted hidden b_m
+ -> causal Transformer residual corrector A_theta(b_m,t_m)
+ -> frozen official LM head
+ -> y_(m+1)
+```
+
+下一轮必须从 `y_(m+1)` 再执行完整 official CLLM forward，禁止把 corrector hidden
+直接送回 corrector。数学定义为：
+
+```text
+J_phi(x,y_m) = (b_m, y_m^J)
+y_m^J = argmax LMHead_phi(b_m)
+A_theta(b,t) = b + (1-t/T) Delta_theta(b,t)
+F_phi,theta(x,y,t) = A_theta(J_phi(x,y).hidden,t)
+y_(m+1) = argmax LMHead_phi(F_phi,theta(x,y_m,t_m))
+```
+
+其中 `J_phi` 固定使用 `cllm/consistency-llm-7b-math`，不能回退到 Abel。
+`Delta_theta` 为 `4096->512`、一层 8-head causal self-attention、
+`512->2048->512` FFN 和 zero-init `512->4096`。显式边界保证：
+
+```text
+A_theta(b,T)=b
+F_phi,theta(x,y,T)=J_phi(x,y).
+```
+
+训练目标固定为：
+
+```text
+L_main = 0.1 L_local + 0.9 L_endpoint
+L_safe = max(0, D(A_theta(b,t),e) - D(b,e))
+L = L_main + 0.1 L_safe + 0.05 L_token.
+```
+
+新 cache 由 official CLLM 从确定性 `y0` 重新 rollout 到 token fixed point，schema 为
+`llm_cdeq_official_cllm_hidden_cache_v1`，与 Abel cache 物理隔离。
+
+2026-07-15 的第一阶段 gate 已完成且通过：64/64 blocks 的 hidden/token alignment 为
+100%，轨迹长度为 3--8；zero residual、`t=T`、disable 三组与 official CLLM 单步
+严格一致；完整 backbone checksum 前后均为
+`2d7c82daaa9ddd454712f4a44b1e07027f03e61fb5ee82da2d46cb3b6e4ed1fb`。
+Init=0、CT=0 的 200-step overfit 将 endpoint relative error 从 `1.212116` 降至
+`0.890527`（改善 26.53%），token agreement 从 `66.8945%` 升至 `83.6914%`，
+samplewise safe violation、EOS collapse 和 repeated-block collapse 均为 0。corrector
+为 7,616,512 参数，占 6,738,677,760 参数 backbone 的 0.1130%。
+
+因此基础 wrapped operator 已通过小规模可行性 gate，但按本阶段范围仍停止在这里：
+不构建 2k/512 cache，不启动完整 GSM8K，不恢复 progress head。下一阶段才讨论放大
+训练，以及基于每轮 official CLLM canonical hidden 的轨迹进度感知 adaptive few-step。
 
 ## 1. 最终决策
 
@@ -817,14 +888,15 @@ Section 7 建议篇幅：
 ### 14.2 Implementation
 
 - [x] 用 Git 分支与快照 commit 保护当前 CDEQ+ baseline。
-- [ ] 复现 AR/Jacobi endpoint equivalence。
-- [ ] 保存 deterministic Jacobi trajectories。
-- [ ] 训练 CDEQ-Jacobi baseline。
+- [x] 抽取 official CLLM single-step，并通过 zero/`t=T`/disable 严格等价测试。
+- [x] 保存 64-block deterministic official CLLM trajectories，alignment 100%。
+- [x] 完成 official CLLM + Transformer corrector 的 200-step baseline gate。
+- [ ] 扩大到 2k/512（本阶段按停止规则未启动）。
 - [ ] 训练全部四组 Init/CT ablation。
 - [x] 运行 oracle-time 1/2/3/4-call recurrence gate（未通过）。
 - [ ] 训练并校准 progress estimator（因 oracle gate 失败而暂停）。
 - [ ] 仅在 rollout gap 出现时加入 detached rollout augmentation（当前不启用）。
-- [ ] 在相同协议下运行 CLLM。
+- [x] 在相同协议下验证 official CLLM 单步 operator；完整 GSM8K 留到下一阶段。
 - [ ] 加入第二个任务。
 
 ### 14.3 Evaluation
