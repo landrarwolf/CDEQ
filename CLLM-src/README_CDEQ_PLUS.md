@@ -123,10 +123,8 @@ deduplicates those candidates, evaluates the frozen Abel one-step transition,
 and retains the longest strictly aligned path ending at the self-mapping
 endpoint. Off-path augmented candidates are recorded and discarded; a block
 with no valid path is rejected. Cache construction first counts complete
-`data_id` groups, orders groups by a seeded stable hash, and fills a
-record-level validation target without splitting a group. This both guarantees
-enough validation candidates and prevents augmented blocks from one problem
-crossing train/validation.
+`data_id` groups and assigns a seeded, group-level hashed split without ever
+splitting a problem across train/validation.
 
 Each 128-example safetensors shard contains:
 
@@ -134,6 +132,13 @@ Each 128-example safetensors shard contains:
 - `state_mask [N,K]` and per-example rho `time_grid [N,K]`;
 - `trajectory_tokens [N,K,16]` and `endpoint_tokens [N,16]`;
 - `token_mask [N,16]`, keeping the first EOS and masking its tail.
+
+The cache builder hashes complete `data_id` groups into train/validation and
+round-robins across groups while selecting blocks. In the first sampling round,
+each problem contributes at most one accepted block; later rounds are used only
+when a requested limit exceeds the available group count. This prevents a few
+very large augmented groups from dominating a subset while preserving strict
+cross-split isolation.
 
 The split manifest records schema version, complete config and revisions, split
 hash, shard counts, alignment rejection counts, and metadata JSONL. The frozen
@@ -191,3 +196,11 @@ python -m py_compile llm_cdeq/*.py
 Tests cover time-grid endpoints, continuous interpolation, progressive pair
 ordering, EOS masks, hidden shift, exact `t=T` identity, initializer detach,
 EMA, parameter budget, safetensors manifests, and checkpoint round-trip.
+
+## Current feasibility result
+
+The first preregistered 2k/512 run did not pass the baseline gate after the full
+rank/LR/loss-weight search, so the 10k/1k four-way ablation was not started.
+See [`reports/FEASIBILITY_REPORT.md`](reports/FEASIBILITY_REPORT.md) for exact
+metrics, the negative-result diagnosis, compact official reproduction evidence,
+and the generated trajectory/training curves.

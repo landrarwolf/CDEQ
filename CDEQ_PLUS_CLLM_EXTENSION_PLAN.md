@@ -34,6 +34,59 @@ SmoothL1`，CT 使用 `q=1.1,d=100,k=8,b=1` 的 progressive rule。
 `LMHead(R(x,y^k))=y^(k+1)` 的状态进入连续 hidden trajectory；不会按原始 JSON
 顺序插值，也不会对 token ID 插值。
 
+## 0.1 2026-07-15 实际执行结果与当前结论
+
+官方工件已在远端完成逐文件校验。Abel-7B-001、CLLM 7B Math 和 GSM8K
+Jacobi 数据均匹配固定 revision；环境为 Python 3.10、PyTorch 2.1.2、
+Transformers 4.36.2、Accelerate 0.25.0、Datasets 2.15.0。FlashAttention
+2.4.1 在当前环境不可用，因此本轮质量复现和 cache 构造统一使用 SDPA，速度结果
+只作为同 backend 的服务器内比较。
+
+已通过的官方复现和工程 gate：
+
+- 官方 GSM8K demo 正确输出 `500`，生成 384 tokens，约 103.15 tokens/s；
+- 100 个 Abel block 上，使用同一 no-cache causal forward primitive 的 greedy AR
+  与 vanilla Jacobi endpoint 为 `100/100` 一致；
+- 64-block 四组过拟合均可下降，其中扩展到 160 steps 后 baseline endpoint error
+  下降 18.34%，CT 下降 48.51%；
+- 远端完整测试为 `28 passed`；
+- target backbone 参数量为 6,738,677,760，rank-512 baseline adapter 可训练参数为
+  5,770,752，约占 backbone 的 0.0856%。
+
+cache 构造曾发现一个重要数据问题：按原始 record 数做 grouped split 时，两个超大
+augmented `data_id` 会垄断 2k train cache。实现已改为对 `data_id` 做确定性
+group-level hash split，并在每个 split 内跨问题轮转取样。重建后的 cache 为：
+
+- train 2,000 blocks / 2,000 unique `data_id`；
+- validation 512 blocks / 512 unique `data_id`；
+- train/validation `data_id` overlap 为 0；
+- 6 个 hidden-token 未对齐候选被拒绝，所有入库状态的冻结 LM-head 对齐为
+  `432,803/432,803`；
+- states 为 BF16 `[N,17,16,4096]`，全部有效 rho time grid 从 0.002 单调到 5.0；
+- 有效 trajectory length 覆盖 2--17，train/validation 平均分别为 10.764/10.854。
+
+2k/512 feasibility baseline 的显式 identity 指标为 endpoint relative error
+`1.011137`、token agreement `43.1885%`。默认配置 20 epochs 达到 `0.876771`
+和 `45.0562%`。Token CE 权重 0.05/0.1/0.2 均提高少量 token agreement，但会明显
+恶化 hidden error，因此固定 `token_ce_weight=0`。
+
+随后完成 rank `{256,512,1024}`、LR `{1e-4,3e-4,1e-3}`、local/global
+`{0.1/0.9,0.2/0.8}` 的 successive halving。最终最优为 rank 512、LR `1e-3`、
+local/global `0.2/0.8`：validation error `0.860156`，token agreement `45.4224%`，
+相对 identity 分别改善 14.94% 和 2.23 个百分点；另一 local=0.1 配置为
+`0.862611` 和 `46.0205%`。两者均未达到本计划规定的 20% / 5pp baseline gate。
+
+训练集诊断也只从 identity `0.998723/43.9875%` 改善到
+`0.838668/47.1469%`，说明主瓶颈不是 train/validation 泄漏或典型过拟合，而是当前
+逐 token bottleneck updater 的 hidden approximation/优化能力。由于 teacher
+trajectory 长度覆盖健康且冻结 LM-head 对齐为 100%，token alignment 和 CT coverage
+不是第一嫌疑。按预注册停止规则，本轮不扩大到 10k/1k，也不启动四组正式消融；
+应先重新审视 representation normalization、跨 token coupling 或 projection/updater
+capacity，并将本轮作为可复现的负 feasibility 结果保留。
+
+官方完整 GSM8K accuracy 和 500-sample speed profiler 仍在远端独立后台运行；其最终
+数字写入复现报告后，才判断官方 checkpoint 的 56.4±1.0 与同机 2x speedup gate。
+
 ## 1. 最终决策
 
 LLM 部分应定位为 **CDEQ+ 的跨领域应用验证**，而不是一篇新的并行解码方法。

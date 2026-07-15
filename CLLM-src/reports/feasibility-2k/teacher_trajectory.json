@@ -1,0 +1,104 @@
+[
+  {
+    "step": 0,
+    "examples": 512,
+    "endpoint_relative_error": 1.0111373023828492,
+    "endpoint_token_agreement": 0.4320068359375
+  },
+  {
+    "step": 1,
+    "examples": 512,
+    "endpoint_relative_error": 0.9382678858819418,
+    "endpoint_token_agreement": 0.4962158203125
+  },
+  {
+    "step": 2,
+    "examples": 508,
+    "endpoint_relative_error": 0.8678948571245502,
+    "endpoint_token_agreement": 0.5570866141732284
+  },
+  {
+    "step": 3,
+    "examples": 504,
+    "endpoint_relative_error": 0.7917503595706963,
+    "endpoint_token_agreement": 0.6184275793650794
+  },
+  {
+    "step": 4,
+    "examples": 493,
+    "endpoint_relative_error": 0.7176735191690994,
+    "endpoint_token_agreement": 0.6735547667342799
+  },
+  {
+    "step": 5,
+    "examples": 477,
+    "endpoint_relative_error": 0.6416747962091454,
+    "endpoint_token_agreement": 0.7215670859538784
+  },
+  {
+    "step": 6,
+    "examples": 451,
+    "endpoint_relative_error": 0.5696154941872853,
+    "endpoint_token_agreement": 0.7649667405764967
+  },
+  {
+    "step": 7,
+    "examples": 419,
+    "endpoint_relative_error": 0.5036865344408873,
+    "endpoint_token_agreement": 0.8038484486873508
+  },
+  {
+    "step": 8,
+    "examples": 374,
+    "endpoint_relative_error": 0.45005442692156145,
+    "endpoint_token_agreement": 0.835394385026738
+  },
+  {
+    "step": 9,
+    "examples": 325,
+    "endpoint_relative_error": 0.39887281527886026,
+    "endpoint_token_agreement": 0.864423076923077
+  },
+  {
+    "step": 10,
+    "examples": 273,
+    "endpoint_relative_error": 0.3444190606092795,
+    "endpoint_token_agreement": 0.8898809523809523
+  },
+  {
+    "step": 11,
+    "examples": 226,
+    "endpoint_relative_error": 0.28369363555602267,
+    "endpoint_token_agreement": 0.9164823008849557
+  },
+  {
+    "step": 12,
+    "examples": 174,
+    "endpoint_relative_error": 0.2411758832890412,
+    "endpoint_token_agreement": 0.9367816091954023
+  },
+  {
+    "step": 13,
+    "examples": 131,
+    "endpoint_relative_error": 0.17311037519505915,
+    "endpoint_token_agreement": 0.9608778625954199
+  },
+  {
+    "step": 14,
+    "examples": 96,
+    "endpoint_relative_error": 0.07707899048303564,
+    "endpoint_token_agreement": 0.9856770833333334
+  },
+  {
+    "step": 15,
+    "examples": 60,
+    "endpoint_relative_error": 0.0,
+    "endpoint_token_agreement": 1.0
+  },
+  {
+    "step": 16,
+    "examples": 22,
+    "endpoint_relative_error": 0.0,
+    "endpoint_token_agreement": 1.0
+  }
+]
