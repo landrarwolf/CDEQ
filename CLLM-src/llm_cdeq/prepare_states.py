@@ -29,45 +29,52 @@ def plan_grouped_split(
     validation_fraction: float,
     validation_minimum: int,
 ) -> tuple[dict[str, str], dict[str, int]]:
-    """Assign complete data-id groups while meeting a record-level validation target."""
+    """Assign complete data-id groups using a deterministic group-level split.
+
+    Augmented Jacobi datasets can contain a few enormous data-id groups.  A
+    record-count knapsack can therefore leave the training side with only one
+    or two questions even when thousands of groups exist.  Splitting the
+    hashed group order itself keeps question diversity while preserving the
+    no-leakage guarantee.
+    """
     if not group_counts or not 0 < validation_fraction < 1:
         raise ValueError("group counts must be non-empty and validation fraction in (0, 1)")
     if validation_minimum < 1:
         raise ValueError("validation minimum must be positive")
     total = sum(int(count) for count in group_counts.values())
-    target = max(validation_minimum, round(total * validation_fraction))
-    if target >= total:
-        raise ValueError("validation target leaves no training records")
+    if len(group_counts) < 2:
+        raise ValueError("grouped split requires at least two data-id groups")
     ordered = sorted(
         group_counts,
         key=lambda data_id: hashlib.sha256(f"{seed}:{data_id}".encode("utf-8")).digest(),
     )
-    validation_ids: set[str] = set()
-    validation_records = 0
-    deferred: list[str] = []
-    for data_id in ordered:
-        count = int(group_counts[data_id])
-        if validation_records + count <= target:
-            validation_ids.add(data_id)
-            validation_records += count
-        else:
-            deferred.append(data_id)
-    if validation_records < target:
-        data_id = min(deferred, key=lambda value: int(group_counts[value]))
+    group_target = min(
+        len(ordered) - 1,
+        max(1, round(len(ordered) * validation_fraction)),
+    )
+    validation_ids = set(ordered[:group_target])
+    validation_records = sum(int(group_counts[data_id]) for data_id in validation_ids)
+    for data_id in ordered[group_target:]:
+        if validation_records >= validation_minimum or len(validation_ids) >= len(ordered) - 1:
+            break
         validation_ids.add(data_id)
         validation_records += int(group_counts[data_id])
+    if validation_records < validation_minimum:
+        raise ValueError("validation groups contain too few records")
     assignment = {
         data_id: "validation" if data_id in validation_ids else "train"
         for data_id in group_counts
     }
+    record_target = max(validation_minimum, round(total * validation_fraction))
     return assignment, {
         "total_records": total,
         "train_records": total - validation_records,
         "validation_records": validation_records,
         "train_groups": len(group_counts) - len(validation_ids),
         "validation_groups": len(validation_ids),
-        "validation_target": target,
-        "validation_overshoot": validation_records - target,
+        "validation_group_target": group_target,
+        "validation_record_target": record_target,
+        "validation_overshoot": validation_records - record_target,
     }
 
 
@@ -381,39 +388,59 @@ def main() -> None:
     accepted = Counter()
     rejected = Counter()
     progress = tqdm(total=train_limit + validation_limit, desc="aligned blocks")
-    for raw in iter_json_array(source):
-        data_id = str(raw["data_id"])
-        split = data_split[data_id]
-        if accepted[split] >= limits[split]:
+    accepted_indices: set[int] = set()
+    accepted_groups = {"train": set(), "validation": set()}
+    sampling_rounds = 0
+    while not all(accepted[name] >= limit for name, limit in limits.items()):
+        sampling_rounds += 1
+        round_groups = {"train": set(), "validation": set()}
+        round_start = sum(accepted.values())
+        for raw_index, raw in enumerate(iter_json_array(source)):
+            if raw_index in accepted_indices:
+                continue
+            data_id = str(raw["data_id"])
+            split = data_split[data_id]
+            if accepted[split] >= limits[split] or data_id in round_groups[split]:
+                continue
+            try:
+                example = normalize_example(raw, int(model_config["block_size"]))
+                record, metadata = encode_trajectory(
+                    model,
+                    example,
+                    block_size=int(model_config["block_size"]),
+                    state_batch_size=int(training["state_batch_size"]),
+                    max_states=int(model_config["max_trajectory_states"]),
+                    epsilon=float(config["time"]["epsilon"]),
+                    terminal=float(config["time"]["terminal"]),
+                    rho=float(config["time"]["rho"]),
+                    device=device,
+                )
+            except HiddenTokenAlignmentError:
+                rejected["hidden_token_alignment"] += 1
+                continue
+            except (KeyError, TypeError, ValueError, RuntimeError) as error:
+                rejected[type(error).__name__] += 1
+                continue
+            if args.strict_alignment and not metadata["alignment_ok"]:
+                rejected["hidden_token_alignment"] += 1
+                continue
+            writers[split].add(record, metadata)
+            accepted[split] += 1
+            accepted_indices.add(raw_index)
+            accepted_groups[split].add(data_id)
+            round_groups[split].add(data_id)
+            progress.update(1)
+            progress.set_postfix(
+                round=sampling_rounds,
+                train=accepted["train"],
+                validation=accepted["validation"],
+            )
             if all(accepted[name] >= limit for name, limit in limits.items()):
                 break
-            continue
-        try:
-            example = normalize_example(raw, int(model_config["block_size"]))
-            record, metadata = encode_trajectory(
-                model,
-                example,
-                block_size=int(model_config["block_size"]),
-                state_batch_size=int(training["state_batch_size"]),
-                max_states=int(model_config["max_trajectory_states"]),
-                epsilon=float(config["time"]["epsilon"]),
-                terminal=float(config["time"]["terminal"]),
-                rho=float(config["time"]["rho"]),
-                device=device,
+        if sum(accepted.values()) == round_start:
+            raise RuntimeError(
+                f"balanced sampling could not fill cache limits: {dict(accepted)}"
             )
-        except HiddenTokenAlignmentError:
-            rejected["hidden_token_alignment"] += 1
-            continue
-        except (KeyError, TypeError, ValueError, RuntimeError) as error:
-            rejected[type(error).__name__] += 1
-            continue
-        if args.strict_alignment and not metadata["alignment_ok"]:
-            rejected["hidden_token_alignment"] += 1
-            continue
-        writers[split].add(record, metadata)
-        accepted[split] += 1
-        progress.update(1)
-        progress.set_postfix(train=accepted["train"], validation=accepted["validation"])
     progress.close()
 
     split_hash = stable_hash(sorted(data_split.items()))
@@ -435,6 +462,10 @@ def main() -> None:
         "strict_alignment": bool(args.strict_alignment),
         "rejected": dict(rejected),
         "split_plan": split_plan,
+        "sampling_rounds": sampling_rounds,
+        "accepted_groups": {
+            split: len(groups) for split, groups in accepted_groups.items()
+        },
         "lm_head_file": "../lm_head.safetensors",
         "backbone_parameter_count": sum(parameter.numel() for parameter in model.parameters()),
     }
@@ -444,6 +475,10 @@ def main() -> None:
         "rejected": dict(rejected),
         "data_split_hash": split_hash,
         "split_plan": split_plan,
+        "sampling_rounds": sampling_rounds,
+        "accepted_groups": {
+            split: len(groups) for split, groups in accepted_groups.items()
+        },
         "manifests": manifests,
     }
     (cache_root / "prepare_summary.json").write_text(

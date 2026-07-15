@@ -33,7 +33,7 @@ def test_deduplication_ignores_tokens_after_eos():
     assert states.tolist() == [[1, 9, 2], [1, 8, 2]]
 
 
-def test_grouped_split_meets_record_target_without_leaking_groups():
+def test_grouped_split_preserves_group_diversity_without_leaking_groups():
     counts = {"large": 90, **{f"small-{index}": 1 for index in range(30)}}
     assignment, summary = plan_grouped_split(
         counts,
@@ -42,8 +42,9 @@ def test_grouped_split_meets_record_target_without_leaking_groups():
         validation_minimum=12,
     )
     assert summary["validation_records"] >= 12
-    assert summary["validation_overshoot"] == 0
-    assert assignment["large"] == "train"
+    assert summary["validation_groups"] >= 3
+    assert summary["train_groups"] >= 18
+    assert summary["validation_group_target"] == 3
     assert summary["train_records"] + summary["validation_records"] == 120
     assert set(assignment) == set(counts)
     assert set(assignment.values()) == {"train", "validation"}
