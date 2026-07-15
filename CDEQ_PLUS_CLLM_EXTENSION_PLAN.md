@@ -23,9 +23,10 @@ SmoothL1`，CT 使用 `q=1.1,d=100,k=8,b=1` 的 progressive rule。
 
 工程实现隔离在 `CLLM-src/llm_cdeq/`，四个稳定入口分别为 `prepare_states`、
 `train`、`evaluate` 和 `profile`。模型、原始轨迹、hidden cache、checkpoint 与实验
-输出只保存在远端，不进入 Git。本轮成功门槛是证明 CDEQ-Jacobi 学到非退化的
-单步 endpoint mapping，Init 和 CT 分别具有正向作用，Init+CT 最佳或并列最佳；
-暂不要求超过 CLLM。
+输出只保存在远端，不进入 Git。本轮首先证明 CDEQ-Jacobi 学到非退化的
+endpoint mapping，再验证轨迹进度感知的自适应少步推理：允许 endpoint-targeted
+updater 在真实推理中调用少量多次，但平均与 P95 调用次数必须显著小于常规 CLLM。
+Init 和 CT 仍需分别具有正向作用，Init+CT 最佳或并列最佳；暂不要求一步超过 CLLM。
 
 官方 `augTrue` 数据经实物检查后还需一个确定性的规范化步骤：其
 `answer_trajectory_ids` 含有重复、交错的 augmented candidates，并非可直接按 JSON
@@ -86,6 +87,55 @@ capacity，并将本轮作为可复现的负 feasibility 结果保留。
 
 官方完整 GSM8K accuracy 和 500-sample speed profiler 仍在远端独立后台运行；其最终
 数字写入复现报告后，才判断官方 checkpoint 的 56.4±1.0 与同机 2x speedup gate。
+
+## 0.2 新增决策：轨迹进度感知的自适应少步推理
+
+完整研究假设、算法定义、证伪条件和分阶段实验见
+[`ADAPTIVE_CDEQ_PLUS_RESEARCH_IDEA.md`](ADAPTIVE_CDEQ_PLUS_RESEARCH_IDEA.md)。
+
+一步到达 endpoint 仍是训练时的监督目标，但不再假设一次近似调用在真实推理时必须
+精确到达 endpoint。若第一次输出只落在教师轨迹某个中间邻域，则估计该输出对应的
+归一化轨迹进度 `p in [0,1]`，将其映射到 rho time，并再次调用同一个 updater：
+
+```text
+z_0 = Init(s_0)                         # initializer 只执行一次
+z_1 = F(z_0, 0)
+p_m = H(z_m)
+t_m = rho_time(p_m)
+z_(m+1) = F(z_m, t_m)                   # 少量重复，仍以 endpoint 为目标
+```
+
+对于含 `K+1` 个状态的教师轨迹，`p_k=k/K`，并使用
+
+```text
+t(p) = (epsilon^(1/rho) + p * (T^(1/rho)-epsilon^(1/rho)))^rho.
+```
+
+这里 `H` 是轻量 progress estimator，而不是 endpoint predictor。线上推理不能通过
+生成完整教师轨迹再做最近邻来判断 point，否则会抵消加速；同一样本教师轨迹上的
+masked hidden nearest-point 只用于 oracle 可行性实验、progress 标注和诊断。
+
+推理时间必须单调但保守：`p_(m+1) >= p_m`，未验证稳定前不得直接把 `t` 设为 `T`，
+因为 `t=T` 是 identity boundary，错误的过早估计会使迭代卡死。停止条件联合使用
+progress 置信度、连续 greedy token 稳定性和 masked hidden update norm，并始终设置
+`max_calls`。initializer 只在第一轮执行。
+
+训练按最小改动原则分三层推进：
+
+1. 保持当前 `all teacher states -> endpoint` 主损失不变，先在 held-out cache 上使用
+   oracle nearest-time 测量 1/2/3/4-call 曲线；如果 error/agreement 不随调用改善，
+   先否决当前 recurrence 假设，不训练 progress head。
+2. oracle 有效后，使用缓存已有的 `(s_k,p_k,t_k)` 训练轻量 `H`，比较
+   oracle-time、learned-time 和 fixed schedule；这会增加辅助进度监督，但不改变
+   CDEQ endpoint、Init 或 CT 的主目标。
+3. 如果 learned-time 有效而 student rollout 出现 off-trajectory drift，再加入小比例
+   stop-gradient rollout augmentation：对学生自产状态继续监督到同一 endpoint，
+   不把目标改成 next point，也不跨离散 argmax 反传整条 rollout。
+
+默认优先验证只重复轻量 adapter 的 latent recurrence，以最大化相对 CLLM 的 NFE
+优势；同时将每轮 greedy token 经冻结 Abel 重新编码回 canonical hidden manifold
+作为稳健性 fallback/消融。后者每轮会增加一次 backbone forward，必须单独报告
+target-backbone NFE，只有在平均调用数仍远低于 CLLM 时才可作为最终方案。
 
 ## 1. 最终决策
 
@@ -295,7 +345,9 @@ delta_u -> up_projection   -> delta_h
 - adjacent-state/EMA consistency；
 - 对 Jacobi endpoint representation `s_K` 的回归；
 - 相同的 boundary interpolation 原则；
-- 除非单独设计 few-step objective，否则只支持已训练的一步推理。
+- 主目标仍训练每个 teacher state 一步指向 endpoint；重复调用先作为被严格验证的
+  inference recurrence，必要时只增加 progress supervision 与 detached rollout
+  exposure，不将监督目标改成 next point。
 
 当前参考 loss 可以在概念上保留：
 
@@ -370,6 +422,21 @@ y_hat      = argmax(logits_hat).
 第一版实现使用 greedy decoding，以匹配 vanilla Jacobi 和 CLLM 的主要理论假设。
 除非 reviewer 或后续研究明确需要，否则 sampling support 不在当前范围内。
 
+### 5.8 Adaptive few-step refinement
+
+单步输出不再被直接视为最终成功，而被视为一次 endpoint projection 的近似结果。
+模型通过轻量 progress estimator 判断输出位于轨迹的等效进度，再用对应 `t` 做下一次
+endpoint-targeted refinement。第一版限制 `max_calls in {1,2,3,4}`，并同时报告：
+
+- output-to-teacher-trajectory distance，验证“输出落在某个中间 point 附近”的前提；
+- oracle-time 与 learned-time 的差距；
+- 每次调用后的 endpoint hidden error、token agreement 和 GSM8K accuracy；
+- 平均、median、P95 adapter calls，以及 target-backbone NFE；
+- stable、max-calls、cycle、EOS 等停止原因。
+
+若 oracle-time 下多次调用仍不改善，则问题不在 time estimator，而在 updater 的
+self-composition/off-manifold behavior；此时不得仅通过增加推理次数掩盖失败。
+
 ## 6. 第一版 LLM 实现的范围边界
 
 ### 6.1 在范围内
@@ -380,7 +447,9 @@ y_hat      = argmax(logits_hat).
 - 复用现有 CDEQ consistency updater；
 - 复用现有 initializer；
 - 复用现有 continuous-time schedule；
-- 执行已经被训练目标支持的一步 CDEQ/CDEQ+ inference；
+- 执行一步 endpoint mapping，并验证轨迹进度感知的 1--4 次自适应少步 refinement；
+- 训练或校准轻量 progress estimator；
+- 必要时加入 detached rollout exposure；
 - 与 CLLM 做正式比较。
 
 ### 6.2 不在第一版范围内
@@ -389,11 +458,11 @@ y_hat      = argmax(logits_hat).
 - 修改 LLM backbone architecture；
 - 从头预训练或 instruction-tune 一个 LLM；
 - 新的 speculative decoding 或 token verification；
-- adaptive halting；
 - stochastic decoding；
-- online/on-policy distillation；
+- 无上限或无停止验证的重复 updater；
+- online/on-policy distillation（离线 detached rollout augmentation 除外）；
 - production serving engine；
-- 在没有匹配目标的情况下重复调用 CDEQ updater。
+- 在没有 progress 条件、停止准则或多步曲线验证的情况下重复调用 CDEQ updater。
 
 这些范围边界保证 LLM 章节与其在 TPAMI 扩展稿中的作用相匹配。
 
@@ -567,6 +636,23 @@ Init=1, CT=1
 - 组合模型改善 quality/latency 或 quality/training-cost Pareto；
 - 增益在多个 seed 或 task subset 上稳定。
 
+### Phase 3.5：adaptive few-step feasibility
+
+1. 不重训 updater，先在 held-out cache 上运行 oracle nearest-time 的 1/2/3/4-call
+   latent recurrence；要求 endpoint error/token agreement 随调用数单调或近单调改善。
+2. oracle 有效后训练 progress estimator，比较 oracle-time、learned-time 与固定 time
+   schedule，并校准 normalized progress error 与置信度。
+3. learned-time 出现 rollout gap 时，再加入 10%--20% detached student rollout
+   augmentation；主监督仍为所有输入状态到 endpoint。
+4. 比较 adapter-only recurrence 与 Abel canonical re-encoding；后者按每轮一次 target
+   forward 计入 NFE 和 wall-clock。
+5. 固定 `max_calls` 后评测 500 样本与完整 GSM8K，报告调用数分布、停止原因以及
+   quality/latency Pareto。
+
+成功信号：相对 one-shot 明显改善 endpoint/token 指标，learned-time 接近 oracle-time，
+且平均与 P95 target-equivalent calls 显著小于常规 CLLM。若 oracle 多步不改善，停止
+该方向并诊断 output-to-trajectory distance，不直接扩大训练或调用预算。
+
 ### Phase 4：正式比较
 
 任务：
@@ -644,6 +730,10 @@ CLLM 源码之外。现有 DEQ/CDEQ 入口未被改写。
 | 辅助 MLP 过大 | 参数高效优势消失 | 使用并报告 bottleneck projection |
 | hidden distance 与 token 不对齐 | MSE 低但生成质量差 | 同时跟踪 token agreement 和任务指标 |
 | one-step collapse | 重复、非法或退化输出 | 保留 endpoint/AR 监督并检查 EOS/mask |
+| student rollout 偏离 teacher manifold | 多次调用反而漂移或过冲 | 先做 oracle-time 诊断，再加入 detached rollout exposure |
+| progress 过估计 | 过早到 `t=T` 后被 identity boundary 卡死 | 单调保守更新、置信下界、`T-delta` cap 与 max-calls |
+| token 稳定但落在错误平台 | 错误早停 | 联合 progress 置信度与 hidden update norm，不单独依赖 token unchanged |
+| canonical re-encoding 过贵 | 相对 CLLM 的加速消失 | 同时报 adapter-only 与 re-encoding NFE/latency |
 | CLLM 使用不同评测协议 | 比较无效 | 在相同模型、数据、硬件和 decoding 下重跑 |
 | LLM 改动污染当前 CDEQ+ | 并行工作不稳定 | 模块隔离并等待受保护 baseline |
 | 范围扩大到 serving research | TPAMI 扩展失焦 | 不加入新的系统级解码方法 |
@@ -707,7 +797,8 @@ Section 7 建议篇幅：
 - [x] 选择第一个 CLLM-compatible model/task：GSM8K / Abel-7B / block 16。
 - [x] 决定使用 final-layer shifted hidden states。
 - [x] 确定 `4096→512→4096` bottleneck。
-- [x] 固定一步训练和一步推理的精确定义。
+- [x] 固定 endpoint-targeted 一步训练定义。
+- [x] 固定轨迹进度感知的 adaptive few-step 推理假设与验证顺序。
 
 ### 14.2 Implementation
 
@@ -716,6 +807,9 @@ Section 7 建议篇幅：
 - [ ] 保存 deterministic Jacobi trajectories。
 - [ ] 训练 CDEQ-Jacobi baseline。
 - [ ] 训练全部四组 Init/CT ablation。
+- [ ] 运行 oracle-time 1/2/3/4-call recurrence gate。
+- [ ] 训练并校准 progress estimator。
+- [ ] 仅在 rollout gap 出现时加入 detached rollout augmentation。
 - [ ] 在相同协议下运行 CLLM。
 - [ ] 加入第二个任务。
 
@@ -724,6 +818,8 @@ Section 7 建议篇幅：
 - [ ] 报告 task quality 与 AR agreement。
 - [ ] 报告 wall-clock latency 和 TPS。
 - [ ] 报告 NFE/Jacobi iterations。
+- [ ] 报告平均/median/P95 calls、停止原因和 learned-time/oracle-time gap。
+- [ ] 报告每轮 output-to-trajectory distance 与 endpoint 改善曲线。
 - [ ] 报告 trainable parameters 和 training memory。
 - [ ] 绘制 trajectory distance 与 token agreement。
 - [ ] 确认性能差异不是来自不同 decoding budget。
