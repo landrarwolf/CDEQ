@@ -337,6 +337,9 @@ def main() -> None:
     validation_limit = args.validation_limit or int(training["validation_limit"])
     validation_fraction = validation_limit / (train_limit + validation_limit)
     device = torch.device(args.device)
+    attention_backend = (
+        args.attention_backend or config["evaluation"]["attention_backend"]
+    )
 
     target_path = resolve_repo_path(config, config["paths"]["target_model"])
     tokenizer = AutoTokenizer.from_pretrained(target_path, use_fast=False)
@@ -344,8 +347,7 @@ def main() -> None:
         target_path,
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
-        attn_implementation=args.attention_backend
-        or config["evaluation"]["attention_backend"],
+        attn_implementation=attention_backend,
     ).to(device).eval()
     for parameter in model.parameters():
         parameter.requires_grad_(False)
@@ -429,6 +431,7 @@ def main() -> None:
             ]
         },
         "dtype": "bfloat16",
+        "attention_backend": attention_backend,
         "strict_alignment": bool(args.strict_alignment),
         "rejected": dict(rejected),
         "split_plan": split_plan,

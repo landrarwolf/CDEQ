@@ -3,7 +3,7 @@ import torch
 
 from llm_cdeq.model import CDEQAdapter, make_ema
 from llm_cdeq.time import rho_time_grid
-from llm_cdeq.train import _interpolate_batch, train_step
+from llm_cdeq.train import _interpolate_batch, evaluate_cache, train_step
 
 
 def make_batch():
@@ -58,3 +58,29 @@ def test_all_ablation_training_steps_are_finite(use_initializer, use_ct):
     assert parts["endpoint"] >= 0
     loss.backward()
     assert any(parameter.grad is not None for parameter in adapter.consistency_parameters())
+
+
+def test_identity_cache_metrics_are_explicit():
+    initial = torch.randn(2, 2, 4)
+    states = torch.stack((initial, initial), dim=1)
+    lm_head = torch.randn(7, 4)
+    endpoint_tokens = torch.nn.functional.linear(initial, lm_head).argmax(dim=-1)
+    shard = {
+        "states": states,
+        "state_mask": torch.ones(2, 2, dtype=torch.bool),
+        "time_grid": rho_time_grid(2).expand(2, -1).clone(),
+        "token_mask": torch.ones(2, 2, dtype=torch.bool),
+        "endpoint_tokens": endpoint_tokens,
+        "trajectory_tokens": torch.zeros(2, 2, 2, dtype=torch.long),
+    }
+
+    class Dataset:
+        def iter_shards(self, **_):
+            yield shard
+
+    metrics = evaluate_cache(
+        None, Dataset(), lm_head, device=torch.device("cpu"), batch_size=2
+    )
+    assert metrics.endpoint_relative_error == 0
+    assert metrics.token_agreement == 1
+    assert metrics.exact_block_match == 1

@@ -259,7 +259,7 @@ def train_initializer(
 
 @torch.inference_mode()
 def evaluate_cache(
-    adapter: CDEQAdapter,
+    adapter: CDEQAdapter | None,
     dataset: HiddenTrajectoryDataset,
     lm_head_weight: torch.Tensor,
     *,
@@ -267,7 +267,8 @@ def evaluate_cache(
     batch_size: int,
     limit: int | None = None,
 ) -> AdapterMetrics:
-    adapter.eval()
+    if adapter is not None:
+        adapter.eval()
     error_sum = 0.0
     agreement = 0
     token_count = 0
@@ -284,10 +285,13 @@ def evaluate_cache(
         endpoint = states[
             torch.arange(states.shape[0], device=device), state_mask.sum(dim=1) - 1
         ]
-        initial = adapter.initialize(states[:, 0]) if adapter.use_initializer else states[:, 0]
-        prediction = adapter.consistency(
-            initial, torch.zeros(states.shape[0], device=device, dtype=states.dtype)
-        )
+        if adapter is None:
+            prediction = states[:, 0]
+        else:
+            initial = adapter.initialize(states[:, 0]) if adapter.use_initializer else states[:, 0]
+            prediction = adapter.consistency(
+                initial, torch.zeros(states.shape[0], device=device, dtype=states.dtype)
+            )
         mask = batch["token_mask"]
         relative = (
             ((prediction - endpoint) * mask.unsqueeze(-1)).flatten(1).norm(dim=1)
@@ -460,8 +464,23 @@ def main() -> None:
     validation_limit = args.validation_limit or len(validation_data)
     accumulation = int(training["gradient_accumulation"])
     initial_metrics = None
+    identity_metrics = None
     initial_metrics_path = output_dir / "initial_metrics.json"
+    identity_metrics_path = output_dir / "identity_metrics.json"
     if start_epoch == 0:
+        identity_metrics = evaluate_cache(
+            None,
+            validation_data,
+            lm_head,
+            device=device,
+            batch_size=int(training["batch_size"]),
+            limit=validation_limit,
+        )
+        identity_metrics_path.write_text(
+            json.dumps(identity_metrics.__dict__, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        print(json.dumps({"identity_validation": identity_metrics.__dict__}, sort_keys=True))
         initial_metrics = evaluate_cache(
             adapter,
             validation_data,
@@ -597,6 +616,15 @@ def main() -> None:
             else (
                 json.loads(initial_metrics_path.read_text(encoding="utf-8"))
                 if initial_metrics_path.exists()
+                else None
+            )
+        ),
+        "identity_validation_metrics": (
+            identity_metrics.__dict__
+            if identity_metrics is not None
+            else (
+                json.loads(identity_metrics_path.read_text(encoding="utf-8"))
+                if identity_metrics_path.exists()
                 else None
             )
         ),
