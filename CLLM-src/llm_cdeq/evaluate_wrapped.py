@@ -165,7 +165,9 @@ def generate_answer(
         "converged_blocks": 0,
     }
     eos_reached = False
-    repeated_block = False
+    constant_token_block = False
+    adjacent_duplicate_block = False
+    previous_full_block: torch.Tensor | None = None
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     started = time.perf_counter()
@@ -192,14 +194,24 @@ def generate_answer(
         ):
             totals[key] += block_metrics[key]
         totals["converged_blocks"] += int(block_metrics["converged"])
-        repeated_block = repeated_block or bool(tokens[:, 1:].eq(tokens[:, :1]).all())
-
         remaining = max_new_tokens - sum(part.numel() for part in generated)
         accepted = tokens[0, :remaining]
         eos = torch.where(accepted.eq(tokenizer.eos_token_id))[0]
         if len(eos):
             accepted = accepted[: int(eos[0]) + 1]
             eos_reached = True
+        full_block = accepted.numel() == block_size
+        constant_token_block = constant_token_block or bool(
+            full_block
+            and accepted.numel() > 1
+            and accepted.eq(accepted[0]).all()
+        )
+        adjacent_duplicate_block = adjacent_duplicate_block or bool(
+            full_block
+            and previous_full_block is not None
+            and torch.equal(accepted, previous_full_block)
+        )
+        previous_full_block = accepted.clone() if full_block else None
         generated.append(accepted.cpu())
         prefix_ids = torch.cat((prefix_ids, accepted.view(1, -1).to(device)), dim=1)
         if eos_reached or sum(part.numel() for part in generated) >= max_new_tokens:
@@ -216,9 +228,132 @@ def generate_answer(
         "eos_first_token": bool(
             output.numel() and int(output[0]) == int(tokenizer.eos_token_id)
         ),
-        "repeated_block": repeated_block,
+        "constant_token_block": constant_token_block,
+        "adjacent_duplicate_block": adjacent_duplicate_block,
+        "repeated_block": constant_token_block or adjacent_duplicate_block,
         "truncated": not eos_reached,
         "all_blocks_converged": totals["converged_blocks"] == totals["blocks"],
+    }
+
+
+def aggregate_diagnostics(diagnostics: list[dict[str, Any]]) -> dict[str, int | float]:
+    integer_fields = (
+        "eos_first_token",
+        "eos_reached",
+        "truncated",
+        "all_blocks_converged",
+        "constant_token_block",
+        "adjacent_duplicate_block",
+        "repeated_block",
+        "generated_tokens",
+        "prompt_prefill_nfe",
+        "cllm_backbone_nfe",
+        "corrector_nfe",
+        "initializer_nfe",
+    )
+    totals: dict[str, int | float] = {
+        key: sum(int(row[key]) for row in diagnostics) for key in integer_fields
+    }
+    totals["empty_outputs"] = sum(int(row["empty_decoded"]) for row in diagnostics)
+    totals["wall_seconds"] = sum(float(row["wall_seconds"]) for row in diagnostics)
+    return totals
+
+
+def gsm8k_phase_decision(
+    method_reports: Mapping[str, Mapping[str, Any]],
+    *,
+    selected_weights: str,
+    evaluation: Mapping[str, Any],
+    sample_limit: int,
+    cache_gate_passed: bool = True,
+) -> dict[str, Any]:
+    if selected_weights not in ("online", "ema"):
+        raise ValueError(
+            "checkpoint selected_weights must be precommitted as 'online' or 'ema'"
+        )
+    selected_method = f"wrapped_{selected_weights}"
+    try:
+        control = method_reports["official_fixed"]
+        selected = method_reports[selected_method]
+    except KeyError as error:
+        raise ValueError(f"missing required GSM8K method report: {error.args[0]}") from error
+
+    threshold_defaults = {
+        "gsm8k_gate_sample_limit": 8,
+        "gsm8k_control_correct_exact": 6,
+        "gsm8k_control_eos_reached_min": 8,
+        "gsm8k_control_truncated_max": 0,
+        "gsm8k_control_repeated_max": 0,
+        "gsm8k_control_all_blocks_converged_min": 8,
+        "gsm8k_control_backbone_nfe_exact": 963,
+        "gsm8k_selected_empty_max": 0,
+        "gsm8k_selected_eos_first_max": 0,
+        "gsm8k_selected_eos_reached_min": 7,
+        "gsm8k_selected_truncated_max": 1,
+        "gsm8k_selected_repeated_max": 1,
+        "gsm8k_base_signal_correct_min": 1,
+        "gsm8k_phase_correct_min": 4,
+        "gsm8k_phase_control_gap_max": 2,
+    }
+    thresholds = {
+        key: int(evaluation.get(key, default))
+        for key, default in threshold_defaults.items()
+    }
+    if any(value < 0 for value in thresholds.values()):
+        raise ValueError("GSM8K phase thresholds must be non-negative")
+
+    control_correct = int(control["score"]["correct"])
+    selected_correct = int(selected["score"]["correct"])
+    control_checks = {
+        "sample_count": sample_limit == thresholds["gsm8k_gate_sample_limit"],
+        "correct": control_correct == thresholds["gsm8k_control_correct_exact"],
+        "eos_reached": int(control["eos_reached"])
+        >= thresholds["gsm8k_control_eos_reached_min"],
+        "truncated": int(control["truncated"])
+        <= thresholds["gsm8k_control_truncated_max"],
+        "repeated": int(control["repeated_block"])
+        <= thresholds["gsm8k_control_repeated_max"],
+        "all_blocks_converged": int(control["all_blocks_converged"])
+        >= thresholds["gsm8k_control_all_blocks_converged_min"],
+        "backbone_nfe": int(control["cllm_backbone_nfe"])
+        == thresholds["gsm8k_control_backbone_nfe_exact"],
+    }
+    selected_checks = {
+        "empty": int(selected["empty_outputs"])
+        <= thresholds["gsm8k_selected_empty_max"],
+        "eos_first": int(selected["eos_first_token"])
+        <= thresholds["gsm8k_selected_eos_first_max"],
+        "eos_reached": int(selected["eos_reached"])
+        >= thresholds["gsm8k_selected_eos_reached_min"],
+        "truncated": int(selected["truncated"])
+        <= thresholds["gsm8k_selected_truncated_max"],
+        "repeated": int(selected["repeated_block"])
+        <= thresholds["gsm8k_selected_repeated_max"],
+    }
+    engineering_control = all(control_checks.values())
+    selected_health = all(selected_checks.values())
+    base_signal = selected_correct >= thresholds["gsm8k_base_signal_correct_min"]
+    phase_quality = (
+        selected_correct >= thresholds["gsm8k_phase_correct_min"]
+        and abs(control_correct - selected_correct)
+        <= thresholds["gsm8k_phase_control_gap_max"]
+    )
+    return {
+        "selected_weights": selected_weights,
+        "selected_method": selected_method,
+        "thresholds": thresholds,
+        "engineering_control_checks": control_checks,
+        "engineering_control_passed": engineering_control,
+        "selected_health_checks": selected_checks,
+        "selected_health_passed": selected_health,
+        "cache_gate_passed": bool(cache_gate_passed),
+        "base_signal": base_signal,
+        "next_phase_allowed": (
+            bool(cache_gate_passed)
+            and engineering_control
+            and selected_health
+            and phase_quality
+        ),
     }
 
 
@@ -286,7 +421,9 @@ def main() -> None:
         "schema_version": WRAPPED_CHECKPOINT_SCHEMA,
         "checkpoint": str(Path(args.checkpoint).resolve()),
         "weights": list(correctors),
+        "selected_weights": package.get("selected_weights"),
     }
+    cache_gate_passed = False
 
     if args.mode in ("cache", "both"):
         cache_root = resolve_repo_path(config, config["paths"]["cache_dir"])
@@ -312,8 +449,20 @@ def main() -> None:
                 "gates": gate_results(metrics, config),
             }
         report["cache"] = cache_report
+        selected_cache = cache_report.get(str(package.get("selected_weights")))
+        cache_gate_passed = bool(
+            selected_cache and all(selected_cache["gates"].values())
+        )
+        report["cache_gate_passed"] = cache_gate_passed
 
     if args.mode in ("gsm8k", "both"):
+        if set(correctors) != {"online", "ema"}:
+            raise ValueError("GSM8K evaluation requires --weights both")
+        selected_weights = package.get("selected_weights")
+        if selected_weights not in correctors:
+            raise ValueError(
+                "checkpoint selected_weights must precommit a loaded online/EMA model"
+            )
         backend = args.attention_backend or config["evaluation"]["attention_backend"]
         model_path = resolve_repo_path(config, config["paths"]["cllm_model"])
         operator = OfficialCLLMSingleStep.from_pretrained(
@@ -385,20 +534,23 @@ def main() -> None:
                 "predictions": str(predictions),
                 "score": score,
                 "diagnostics": diagnostics,
-                "empty_outputs": sum(int(row["empty_decoded"]) for row in diagnostics),
-                "eos_first_token": sum(int(row["eos_first_token"]) for row in diagnostics),
-                "repeated_block": sum(int(row["repeated_block"]) for row in diagnostics),
-                "generated_tokens": sum(int(row["generated_tokens"]) for row in diagnostics),
-                "cllm_backbone_nfe": sum(int(row["cllm_backbone_nfe"]) for row in diagnostics),
-                "corrector_nfe": sum(int(row["corrector_nfe"]) for row in diagnostics),
-                "wall_seconds": sum(float(row["wall_seconds"]) for row in diagnostics),
+                **aggregate_diagnostics(diagnostics),
             }
+        phase_decision = gsm8k_phase_decision(
+            method_reports,
+            selected_weights=selected_weights,
+            evaluation=config["evaluation"],
+            sample_limit=sample_limit,
+            cache_gate_passed=cache_gate_passed,
+        )
         report["gsm8k"] = {
             "sample_limit": sample_limit,
             "max_new_tokens": max_new_tokens,
             "max_rounds": max_rounds,
             "attention_backend": backend,
             "correctness_only_reprefill": True,
+            "speed_claim_allowed": False,
+            "phase_decision": phase_decision,
             "methods": method_reports,
         }
 

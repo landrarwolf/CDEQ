@@ -9,6 +9,7 @@ import yaml
 
 
 CONFIG_SCHEMA = "llm_cdeq_config_v1"
+CACHE_TIME_GRID_CONTRACT = "exact_epsilon_to_terminal_v1"
 
 
 def load_config(path: str | Path) -> dict[str, Any]:
@@ -60,6 +61,11 @@ def validate_config(config: Mapping[str, Any]) -> None:
         float(training["local_weight"]) + float(training["endpoint_weight"]) - 1.0
     ) > 1e-6:
         raise ValueError("local_weight + endpoint_weight must equal 1")
+    if training.get("checkpoint_selection", "online_endpoint_error") not in (
+        "online_endpoint_error",
+        "token_exact_any",
+    ):
+        raise ValueError("unsupported training.checkpoint_selection")
 
 
 def public_config(config: Mapping[str, Any]) -> dict[str, Any]:
@@ -68,6 +74,62 @@ def public_config(config: Mapping[str, Any]) -> dict[str, Any]:
 
 def config_digest(config: Mapping[str, Any]) -> str:
     payload = json.dumps(public_config(config), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def cache_config_digest(
+    config: Mapping[str, Any],
+    *,
+    train_limit: int | None = None,
+    validation_limit: int | None = None,
+    shard_size: int | None = None,
+    attention_backend: str | None = None,
+) -> str:
+    """Hash only the effective inputs that determine an official CLLM cache."""
+    upstream = config["upstream"]
+    model = config["model"]
+    time = config["time"]
+    training = config["training"]
+    recipe = {
+        "upstream": {
+            key: value
+            for key, value in upstream.items()
+            if key == "code_revision" or key.endswith(("_id", "_revision"))
+        },
+        "model": {
+            "operator": model.get("operator"),
+            "hidden_size": int(model["hidden_size"]),
+            "block_size": int(model["block_size"]),
+            "max_trajectory_states": int(model["max_trajectory_states"]),
+            "cache_schema": model.get("cache_schema"),
+        },
+        "time": {
+            "epsilon": float(time["epsilon"]),
+            "terminal": float(time["terminal"]),
+            "rho": float(time["rho"]),
+            "grid_contract": CACHE_TIME_GRID_CONTRACT,
+        },
+        "data": {
+            "seed": int(training["seed"]),
+            "train_limit": int(
+                training["train_limit"] if train_limit is None else train_limit
+            ),
+            "validation_limit": int(
+                training.get("validation_limit", 0)
+                if validation_limit is None
+                else validation_limit
+            ),
+            "shard_size": int(
+                training["shard_size"] if shard_size is None else shard_size
+            ),
+        },
+        "attention_backend": str(
+            config["evaluation"]["attention_backend"]
+            if attention_backend is None
+            else attention_backend
+        ),
+    }
+    payload = json.dumps(recipe, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 

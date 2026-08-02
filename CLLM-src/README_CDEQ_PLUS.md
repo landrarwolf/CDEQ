@@ -116,6 +116,34 @@ online, and wrapped EMA. Wrapped online/EMA repeated within blocks on 7/8 and
 The engineering path is validated, but this Base one-step model is not an
 end-to-end quality pass; Init/CT remains disabled pending a stronger Base.
 
+### 2026-08-02 Base root-cause repair screen
+
+The follow-up run fixed the local target direction, made every deployment loss
+use `canonical_hidden[:,0]` at exact `t=0`, excluded position 0 from token CE,
+and rebuilt an isolated exact-terminal cache at
+`/home/ljc/data/cllm/hidden_state_cache/gsm8k_official_cllm_512_128_timefix_v2`.
+The cache contains 512 train and 128 validation trajectories with zero overlap,
+100% hidden/token alignment, lengths 2--10, and all 640 final valid times exactly
+equal to float32 `5.0`. Its recipe fingerprint is
+`3d5bceed7d953b09e23ff7f85d72ecd7aa6ef19e9c1bb31746fa6b2a8e37cd53`.
+
+All three candidates completed the pre-registered 5 epochs/320 steps. The table
+reports the cache-preselected online/EMA checkpoint; token agreement retains the
+old full-block metric so it is directly comparable with the 70.70% baseline.
+
+| Run | CE | Weights / epoch | Endpoint improvement | Token agreement (gain) | Exact block | Safety/EOS/repeat | 5-epoch gate |
+| --- | ---: | --- | ---: | ---: | ---: | --- | --- |
+| `token005` | 0.05 | EMA / 2 | 17.89% | 71.48% (+0.78pp) | 0/128 | 0 / 0 / 0 | Fail |
+| `token010` | 0.10 | EMA / 2 | 15.37% | 71.48% (+0.78pp) | 1/128 | 0 / 0 / 0 | Fail |
+| `token020` | 0.20 | EMA / 3 | 13.82% | 71.14% (+0.44pp) | 1/128 | 0 / 0 / 0 | Fail |
+
+Every run passed the 10% endpoint and safety gates, but none reached both the
+`+1pp` token and `2%` exact-block thresholds. Per protocol, no candidate was
+continued to 10 epochs and no GSM8K evaluator was run. Init/CT therefore remain
+disabled. The remote acceptance evidence was 70 unit tests passed/1 skipped,
+one real 7B identity/dtype/full-backbone-checksum integration passed, and a
+1+1-epoch resume smoke ending at step 16.
+
 The following commands are preserved only for reproducing the failed MLP-only
 diagnostic and its checkpoints:
 
@@ -208,8 +236,13 @@ single-step operator until token fixed point. Each state stores:
 `LMHead(canonical_hidden)` must match the official Jacobi-shifted tokens at every
 valid state. The schema is
 `llm_cdeq_official_cllm_hidden_cache_v1`, under
-`/home/ljc/data/cllm/hidden_state_cache/gsm8k_official_cllm_v1`; the wrapped
-trainer refuses the legacy Abel schema.
+`/home/ljc/data/cllm/hidden_state_cache/gsm8k_official_cllm_512_128_timefix_v2`
+for the active Base screen; the wrapped trainer refuses the legacy Abel schema.
+New manifests declare
+`time_grid_contract=exact_epsilon_to_terminal_v1` and a cache-only recipe
+digest. Losses, gates, corrector capacity, epochs, and output paths do not alter
+that digest. Older manifests without the recipe digest retain strict full-config
+digest validation and are not silently treated as new caches.
 
 ## Legacy Abel cache contract
 
@@ -269,13 +302,20 @@ corrector. The block's first hidden position is preserved because its token is
 already fixed by prompt prefill. The initializer, when later enabled, may run
 only at round zero and is detached before the corrector.
 
-The short-gate objective is
-`0.1 L_local + 0.9 L_endpoint + 0.1 L_safe + 0.05 L_token`, with
-`safe_margin=0`. Wrapped checkpoints use
+The repaired Base local objective maps
+`online(earlier,t_earlier)` to `stopgrad EMA(later,t_later)`. Endpoint, safe,
+and token losses all use `canonical_hidden[:,0]` at exact `t=0`; the random
+adjacent pair is used only by the local loss. Position 0 and positions after the
+first EOS do not contribute token CE, while reported agreement keeps the prior
+full-block definition. The screened objective is
+`0.1 L_local + 0.9 L_endpoint + 0.1 L_safe + w_token L_token`, with
+`w_token in {0.05,0.10,0.20}` and `safe_margin=0`. Wrapped checkpoints use
 `llm_cdeq_wrapped_checkpoint_v1` and include corrector/EMA/optimizer weights,
-the full config, split hash, parameter counts, best metrics, and backbone
-checksums. The official backbone and LM head are frozen and absent from the
-optimizer.
+the full config, split hash, parameter counts, best metrics, selected weights,
+selection key/epoch, and backbone checksums. Best-checkpoint selection is
+lexicographic by token agreement, exact block match, then lower endpoint error
+across online and EMA; unsafe or collapsed weights are ineligible. The official
+backbone and LM head are frozen and absent from the optimizer.
 
 ## Legacy MLP checkpoint contract
 

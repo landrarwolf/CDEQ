@@ -1,0 +1,76 @@
+schema_version: llm_cdeq_config_v1
+upstream:
+  code_revision: 22775363f8563c63620e71f7a204e90a51d6a379
+  cllm_model_id: cllm/consistency-llm-7b-math
+  cllm_model_revision: 904a1eefdf8e33a3440ddea35a55dd75cead648c
+  tokenizer_id: cllm/consistency-llm-7b-math
+  tokenizer_revision: 904a1eefdf8e33a3440ddea35a55dd75cead648c
+  initial_state_dataset_id: cllm/cleaned_gsm8k_train_jacobian16_augTrue_labels_True_max_seq_len_256
+  initial_state_dataset_revision: d29940a2d0ac1dea42e92d758598c64c0041a3c1
+paths:
+  cllm_model: /home/ljc/models/cllm/consistency-llm-7b-math
+  trajectory_json: /home/ljc/data/cllm/cleaned_gsm8k_train_jacobian16_augTrue_labels_True_max_seq_len_256.json
+  cache_dir: /home/ljc/data/cllm/hidden_state_cache/gsm8k_official_cllm_512_128_timefix_v2
+  output_dir: /home/ljc/experiments/cllm-cdeq/wrapped-base-timefix-token005-seed42
+  gsm8k_test: eval/gsm8k/test.jsonl
+model:
+  operator: official_cllm
+  hidden_size: 4096
+  block_size: 16
+  max_trajectory_states: 17
+  corrector_rank: 512
+  corrector_layers: 1
+  corrector_heads: 8
+  corrector_ffn_size: 2048
+  preserve_first_position: true
+  use_initializer: false
+  cache_schema: llm_cdeq_official_cllm_hidden_cache_v1
+time:
+  epsilon: 0.002
+  terminal: 5.0
+  rho: 7.0
+  q: 1.1
+  d: 100
+  k: 8.0
+  b: 1.0
+training:
+  seed: 42
+  train_limit: 512
+  validation_limit: 128
+  shard_size: 64
+  batch_size: 8
+  epochs: 10
+  learning_rate: 0.0003
+  weight_decay: 0.01
+  ema_decay: 0.98
+  local_weight: 0.1
+  endpoint_weight: 0.9
+  safe_margin: 0.0
+  safe_weight: 0.1
+  token_ce_weight: 0.05
+  gradient_clip: 1.0
+  checkpoint_selection: token_exact_any
+evaluation:
+  attention_backend: sdpa
+  endpoint_error_improvement_gate: 0.20
+  token_agreement_gain_gate: 0.01
+  exact_block_match_gate: 0.05
+  exact_block_improvement_gate: 0.03
+  safe_violation_rate_gate: 0.05
+  sample_limit: 8
+  max_new_tokens: 512
+  gsm8k_gate_sample_limit: 8
+  gsm8k_control_correct_exact: 6
+  gsm8k_control_eos_reached_min: 8
+  gsm8k_control_truncated_max: 0
+  gsm8k_control_repeated_max: 0
+  gsm8k_control_all_blocks_converged_min: 8
+  gsm8k_control_backbone_nfe_exact: 963
+  gsm8k_selected_empty_max: 0
+  gsm8k_selected_eos_first_max: 0
+  gsm8k_selected_eos_reached_min: 7
+  gsm8k_selected_truncated_max: 1
+  gsm8k_selected_repeated_max: 1
+  gsm8k_base_signal_correct_min: 1
+  gsm8k_phase_correct_min: 4
+  gsm8k_phase_control_gap_max: 2

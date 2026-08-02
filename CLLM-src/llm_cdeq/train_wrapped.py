@@ -14,7 +14,14 @@ import torch.nn.functional as F
 from safetensors.torch import load_file
 
 from .cllm_cache import OfficialCLLMTrajectoryDataset
-from .config import config_digest, load_config, public_config, resolve_repo_path
+from .config import (
+    CACHE_TIME_GRID_CONTRACT,
+    cache_config_digest,
+    config_digest,
+    load_config,
+    public_config,
+    resolve_repo_path,
+)
 from .corrector import TransformerResidualCorrector, corrector_parameter_count
 from .model import update_ema_
 from .runtime import move_batch, seed_everything, stable_hash
@@ -95,6 +102,12 @@ def _samplewise_smooth_l1(
     return (loss * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1)
 
 
+def _trainable_token_mask(mask: torch.Tensor) -> torch.Tensor:
+    trainable = mask.clone()
+    trainable[:, 0] = False
+    return trainable
+
+
 def _select_adjacent(
     batch: Mapping[str, torch.Tensor], generator: torch.Generator
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -130,20 +143,27 @@ def wrapped_train_step(
     mask = batch["eos_mask"]
     endpoint = batch["endpoint_hidden"]
     endpoint_tokens = batch["endpoint_tokens"]
-    endpoint_prediction = corrector(earlier, earlier_time)
+    base = batch["canonical_hidden"][:, 0]
+    zero_time = torch.zeros(base.shape[0], device=base.device, dtype=base.dtype)
+    endpoint_prediction = corrector(base, zero_time)
+    local_prediction = corrector(earlier, earlier_time)
     with torch.no_grad():
-        local_target = ema(earlier, earlier_time)
-    local_prediction = corrector(later, later_time)
+        local_target = ema(later, later_time)
     local_loss = _masked_mse(local_prediction, local_target, mask)
     endpoint_loss = _masked_smooth_l1(endpoint_prediction, endpoint, mask)
     corrected_sample = _samplewise_smooth_l1(endpoint_prediction, endpoint, mask)
-    base_sample = _samplewise_smooth_l1(earlier, endpoint, mask)
+    base_sample = _samplewise_smooth_l1(base, endpoint, mask)
 
     training = config["training"]
     safe_margin = float(training.get("safe_margin", 0.0))
     safe_loss = F.relu(corrected_sample - base_sample + safe_margin).mean()
+    token_mask = _trainable_token_mask(mask)
     logits = F.linear(endpoint_prediction, lm_head_weight)
-    token_loss = F.cross_entropy(logits[mask], endpoint_tokens[mask])
+    token_loss = (
+        F.cross_entropy(logits[token_mask], endpoint_tokens[token_mask])
+        if bool(token_mask.any())
+        else logits.sum() * 0
+    )
     main_loss = float(training["local_weight"]) * local_loss + float(
         training["endpoint_weight"]
     ) * endpoint_loss
@@ -231,17 +251,74 @@ def evaluate_wrapped_cache(
 
 def gate_results(metrics: WrappedMetrics, config: Mapping[str, Any]) -> dict[str, bool]:
     evaluation = config["evaluation"]
-    return {
+    gates = {
         "endpoint_error_improvement": metrics.endpoint_error_improvement
         >= float(evaluation["endpoint_error_improvement_gate"]),
-        "token_agreement_preserved": metrics.token_agreement
-        >= metrics.baseline_token_agreement
-        - float(evaluation["token_agreement_drop_gate"]),
         "safe_violation_rate": metrics.safe_violation_rate
         <= float(evaluation["safe_violation_rate_gate"]),
         "no_eos_collapse": metrics.eos_collapse_rate == 0,
         "no_repeated_output_collapse": metrics.repeated_block_rate == 0,
     }
+    if "token_agreement_gain_gate" in evaluation:
+        gates["token_agreement_improved"] = metrics.token_agreement >= (
+            metrics.baseline_token_agreement
+            + float(evaluation["token_agreement_gain_gate"])
+        )
+    else:
+        gates["token_agreement_preserved"] = metrics.token_agreement >= (
+            metrics.baseline_token_agreement
+            - float(evaluation["token_agreement_drop_gate"])
+        )
+    if "exact_block_match_gate" in evaluation:
+        threshold = max(
+            float(evaluation["exact_block_match_gate"]),
+            metrics.baseline_exact_block_match
+            + float(evaluation.get("exact_block_improvement_gate", 0.0)),
+        )
+        gates["exact_block_match"] = metrics.exact_block_match >= threshold
+    return gates
+
+
+def selection_key(metrics: WrappedMetrics) -> tuple[float, float, float]:
+    return (
+        metrics.token_agreement,
+        metrics.exact_block_match,
+        -metrics.endpoint_relative_error,
+    )
+
+
+def _selection_safe(metrics: WrappedMetrics, config: Mapping[str, Any]) -> bool:
+    evaluation = config["evaluation"]
+    return (
+        metrics.safe_violation_rate <= float(evaluation["safe_violation_rate_gate"])
+        and metrics.eos_collapse_rate == 0
+        and metrics.repeated_block_rate == 0
+    )
+
+
+def select_validation_weights(
+    online: WrappedMetrics,
+    ema: WrappedMetrics,
+    config: Mapping[str, Any],
+) -> tuple[str, WrappedMetrics, tuple[float, ...]] | None:
+    mode = config["training"].get("checkpoint_selection", "online_endpoint_error")
+    if mode == "online_endpoint_error":
+        return "online", online, (-online.endpoint_relative_error,)
+    if mode != "token_exact_any":
+        raise ValueError(f"unsupported checkpoint selection: {mode!r}")
+    candidates = [
+        (name, metrics)
+        for name, metrics in (("online", online), ("ema", ema))
+        if _selection_safe(metrics, config)
+    ]
+    if not candidates:
+        return None
+    # Equal metrics prefer EMA, which is the stable inference weight.
+    name, metrics = max(
+        candidates,
+        key=lambda item: (*selection_key(item[1]), item[0] == "ema"),
+    )
+    return name, metrics, selection_key(metrics)
 
 
 def save_wrapped_checkpoint(
@@ -259,6 +336,11 @@ def save_wrapped_checkpoint(
     best_endpoint_relative_error: float | None = None,
     best_metrics: WrappedMetrics | None = None,
     ema_metrics: WrappedMetrics | None = None,
+    selected_weights: str = "online",
+    current_selection_key: tuple[float, ...] | None = None,
+    best_selected_weights: str | None = None,
+    best_selection_key: tuple[float, ...] | None = None,
+    best_selected_epoch: int | None = None,
 ) -> None:
     trainable = corrector_parameter_count(corrector)
     backbone = int(manifest["backbone_parameter_count"])
@@ -282,6 +364,12 @@ def save_wrapped_checkpoint(
         "validation_metrics": asdict(metrics),
         "best_validation_metrics": asdict(best_metrics or metrics),
         "ema_validation_metrics": asdict(ema_metrics) if ema_metrics else None,
+        "selected_weights": selected_weights,
+        "selected_epoch": epoch,
+        "selection_key": list(current_selection_key or ()),
+        "best_selected_weights": best_selected_weights or selected_weights,
+        "best_selection_key": list(best_selection_key or current_selection_key or ()),
+        "best_selected_epoch": epoch if best_selected_epoch is None else best_selected_epoch,
         "global_step": global_step,
         "epoch": epoch,
         "epoch_complete": epoch_complete,
@@ -335,11 +423,26 @@ def validate_cache_pair(
         "backbone_checksum",
         "cllm_model_id",
         "cllm_model_revision",
+        "tokenizer_id",
+        "tokenizer_revision",
+        "attention_backend",
+        "lm_head_sha256",
+        "cache_hidden_token_alignment",
+        "data_id_overlap",
+        "time_grid_contract",
+        "cache_config_digest",
     ):
         if train_manifest.get(key) != validation_manifest.get(key):
             raise ValueError(f"train/validation cache mismatch for {key}")
-    if train_manifest.get("config_digest") != config_digest(config):
-        raise ValueError("cache and training config digests do not match")
+    cache_digest = train_manifest.get("cache_config_digest")
+    if cache_digest is None:
+        if train_manifest.get("config_digest") != config_digest(config):
+            raise ValueError("legacy cache and training config digests do not match")
+    else:
+        if train_manifest.get("time_grid_contract") != CACHE_TIME_GRID_CONTRACT:
+            raise ValueError("cache does not satisfy the exact time-grid contract")
+        if cache_digest != cache_config_digest(config):
+            raise ValueError("cache recipe and training config digests do not match")
     if int(train_manifest.get("data_id_overlap", -1)) != 0:
         raise ValueError("official CLLM cache reports train/validation leakage")
 
@@ -453,6 +556,9 @@ def main() -> None:
     global_step = 0
     best_error = math.inf
     best_metrics: WrappedMetrics | None = None
+    best_selection_key: tuple[float, ...] | None = None
+    best_selected_weights = "online"
+    best_selected_epoch = -1
     start_epoch = 0
     if resume_path is not None:
         package = load_wrapped_checkpoint(
@@ -471,6 +577,15 @@ def main() -> None:
         global_step = int(package["global_step"])
         best_error = float(package["best_endpoint_relative_error"])
         best_metrics = WrappedMetrics(**package["best_validation_metrics"])
+        raw_best_key = package.get("best_selection_key")
+        if raw_best_key:
+            best_selection_key = tuple(float(value) for value in raw_best_key)
+        elif training.get("checkpoint_selection", "online_endpoint_error") == "online_endpoint_error":
+            best_selection_key = (-best_metrics.endpoint_relative_error,)
+        else:
+            best_selection_key = selection_key(best_metrics)
+        best_selected_weights = str(package.get("best_selected_weights", "online"))
+        best_selected_epoch = int(package.get("best_selected_epoch", package["epoch"]))
     else:
         baseline_online = evaluate_wrapped_cache(
             corrector,
@@ -546,9 +661,23 @@ def main() -> None:
             device=device,
             batch_size=batch_size,
         )
-        improved = online_metrics.endpoint_relative_error < best_error
+        selection = select_validation_weights(online_metrics, ema_metrics, config)
+        if selection is None:
+            current_selected_weights = "online"
+            current_metrics = online_metrics
+            current_selection_key: tuple[float, ...] = ()
+            improved = False
+        else:
+            current_selected_weights, current_metrics, current_selection_key = selection
+            improved = (
+                best_selection_key is None
+                or current_selection_key > best_selection_key
+            )
         if improved:
-            best_metrics = online_metrics
+            best_metrics = current_metrics
+            best_selection_key = current_selection_key
+            best_selected_weights = current_selected_weights
+            best_selected_epoch = epoch
         best_error = min(best_error, online_metrics.endpoint_relative_error)
         record = {
             "epoch": epoch,
@@ -559,6 +688,11 @@ def main() -> None:
             "validation": {
                 "online": asdict(online_metrics),
                 "ema": asdict(ema_metrics),
+            },
+            "selection": {
+                "weights": current_selected_weights,
+                "key": list(current_selection_key),
+                "improved": improved,
             },
         }
         save_wrapped_checkpoint(
@@ -575,6 +709,11 @@ def main() -> None:
             best_endpoint_relative_error=best_error,
             best_metrics=best_metrics,
             ema_metrics=ema_metrics,
+            selected_weights=current_selected_weights,
+            current_selection_key=current_selection_key,
+            best_selected_weights=best_selected_weights,
+            best_selection_key=best_selection_key,
+            best_selected_epoch=best_selected_epoch,
         )
         if improved:
             save_wrapped_checkpoint(
@@ -591,6 +730,11 @@ def main() -> None:
                 best_endpoint_relative_error=best_error,
                 best_metrics=best_metrics,
                 ema_metrics=ema_metrics,
+                selected_weights=current_selected_weights,
+                current_selection_key=current_selection_key,
+                best_selected_weights=best_selected_weights,
+                best_selection_key=best_selection_key,
+                best_selected_epoch=best_selected_epoch,
             )
         with history_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(record, sort_keys=True) + "\n")
@@ -621,6 +765,12 @@ def main() -> None:
     )
     online_gates = gate_results(final_online, config)
     ema_gates = gate_results(final_ema, config)
+    selected_weights = str(package.get("selected_weights", "online"))
+    if selected_weights not in ("online", "ema"):
+        raise ValueError(f"checkpoint selected unsupported weights: {selected_weights!r}")
+    selected_metrics = final_online if selected_weights == "online" else final_ema
+    selected_gates = online_gates if selected_weights == "online" else ema_gates
+    cache_gate_passed = all(selected_gates.values())
     report = {
         "schema_version": WRAPPED_CHECKPOINT_SCHEMA,
         "requested_epochs": epochs,
@@ -633,7 +783,13 @@ def main() -> None:
             "online": all(online_gates.values()),
             "ema": all(ema_gates.values()),
         },
-        "next_phase_allowed": all(online_gates.values()) or all(ema_gates.values()),
+        "selected_weights": selected_weights,
+        "selection_key": package.get("selection_key", []),
+        "selected_epoch": int(package.get("epoch", -1)) + 1,
+        "selected_metrics": asdict(selected_metrics),
+        "selected_gates": selected_gates,
+        "cache_gate_passed": cache_gate_passed,
+        "phase_status": "pending_gsm8k" if cache_gate_passed else "cache_failed",
         "trainable_parameter_count": trainable,
         "backbone_parameter_count": backbone,
         "trainable_fraction": trainable / backbone,

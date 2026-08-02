@@ -21,9 +21,14 @@ def rho_time_grid(
     if steps == 1:
         return torch.tensor([terminal], device=device, dtype=dtype)
     j = torch.linspace(0, 1, steps, device=device, dtype=dtype)
-    start = torch.as_tensor(epsilon, device=device, dtype=dtype).pow(1 / rho)
-    end = torch.as_tensor(terminal, device=device, dtype=dtype).pow(1 / rho)
-    return (start + j * (end - start)).pow(rho)
+    epsilon_value = torch.as_tensor(epsilon, device=device, dtype=dtype)
+    terminal_value = torch.as_tensor(terminal, device=device, dtype=dtype)
+    start = epsilon_value.pow(1 / rho)
+    end = terminal_value.pow(1 / rho)
+    grid = (start + j * (end - start)).pow(rho)
+    grid[0] = epsilon_value
+    grid[-1] = terminal_value
+    return grid
 
 
 def interpolate_trajectory(
@@ -75,4 +80,3 @@ def sample_continuous_pair(
     r = t * (1 - n_t / q_power)
     r = torch.minimum(r.clamp_min(eps), t)
     return t, r
-

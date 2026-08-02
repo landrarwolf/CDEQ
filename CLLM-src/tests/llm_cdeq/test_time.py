@@ -4,11 +4,21 @@ import torch
 from llm_cdeq.time import interpolate_trajectory, rho_time_grid, sample_continuous_pair
 
 
-def test_rho_grid_has_fixed_endpoints_and_is_monotone():
-    grid = rho_time_grid(17, epsilon=0.002, terminal=5.0, rho=7.0)
-    assert grid[0].item() == pytest.approx(0.002, rel=1e-5)
-    assert grid[-1].item() == pytest.approx(5.0, rel=1e-5)
-    assert torch.all(grid[1:] > grid[:-1])
+@pytest.mark.parametrize("dtype", (torch.float32, torch.float64))
+def test_rho_grid_has_exact_typed_endpoints_and_is_monotone(dtype):
+    epsilon = torch.tensor(0.002, dtype=dtype)
+    terminal = torch.tensor(5.0, dtype=dtype)
+    for steps in range(2, 18):
+        grid = rho_time_grid(
+            steps,
+            epsilon=epsilon.item(),
+            terminal=terminal.item(),
+            rho=7.0,
+            dtype=dtype,
+        )
+        assert torch.equal(grid[0], epsilon)
+        assert torch.equal(grid[-1], terminal)
+        assert torch.all(grid[1:] > grid[:-1])
 
 
 def test_interpolation_only_changes_hidden_values():
@@ -24,4 +34,3 @@ def test_progressive_pair_respects_domain_and_order():
     assert torch.all(earlier >= 0.002)
     assert torch.all(later <= 5.0)
     assert torch.all(earlier <= later)
-

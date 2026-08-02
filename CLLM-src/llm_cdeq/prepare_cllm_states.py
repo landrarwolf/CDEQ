@@ -13,7 +13,14 @@ from tqdm import tqdm
 
 from .cllm_cache import OFFICIAL_CLLM_CACHE_SCHEMA, write_official_shard
 from .cllm_step import OFFICIAL_CLLM_ID, OfficialCLLMSingleStep, parameter_checksum
-from .config import config_digest, load_config, public_config, resolve_repo_path
+from .config import (
+    CACHE_TIME_GRID_CONTRACT,
+    cache_config_digest,
+    config_digest,
+    load_config,
+    public_config,
+    resolve_repo_path,
+)
 from .runtime import eos_mask, iter_json_array, split_for_data_id, stable_hash, unbatch_ids
 from .time import rho_time_grid
 
@@ -336,6 +343,7 @@ def main() -> None:
     common = {
         "schema_version": OFFICIAL_CLLM_CACHE_SCHEMA,
         "operator": "official_cllm",
+        "time_grid_contract": CACHE_TIME_GRID_CONTRACT,
         "created_unix": time.time(),
         "lm_head_file": "../lm_head.safetensors",
         "lm_head_sha256": _sha256(cache_root / "lm_head.safetensors"),
@@ -358,6 +366,13 @@ def main() -> None:
         "eos_token_id": operator.model.config.eos_token_id,
         "config": public_config(config),
         "config_digest": config_digest(config),
+        "cache_config_digest": cache_config_digest(
+            config,
+            train_limit=train_limit,
+            validation_limit=validation_limit,
+            shard_size=shard_size,
+            attention_backend=attention_backend,
+        ),
         "data_split_hash": split_hash,
         "split_counts": accepted,
         "data_id_overlap": 0,
@@ -367,6 +382,8 @@ def main() -> None:
     summary = {
         "manifests": manifests,
         "accepted": accepted,
+        "time_grid_contract": CACHE_TIME_GRID_CONTRACT,
+        "cache_config_digest": common["cache_config_digest"],
         "data_id_overlap": 0,
         "data_split_hash": split_hash,
         "rejected": rejected,
