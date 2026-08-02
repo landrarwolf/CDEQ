@@ -74,12 +74,47 @@ python -m llm_cdeq.prepare_cllm_states \
 
 python -m llm_cdeq.train_wrapped \
   --config configs/llm_cdeq/gsm8k_wrapped_cllm.yaml \
-  --init 0 --ct 0 --device cuda
+  --init 0 --ct 0 --overfit --device cuda
 ```
 
-`train_wrapped` is hard-capped at 200 optimizer steps by the config. It rejects
-Init/CT until the base wrapped gate passes, rejects the legacy Abel cache schema,
-and never loads Abel as a fallback operator.
+The preserved 64-block command is an explicit train-set overfit gate. Without
+`--overfit`, `train_wrapped` requires separate train and validation manifests.
+It rejects Init/CT until the base wrapped gate passes, rejects the legacy Abel
+cache schema, and never loads Abel as a fallback operator.
+
+The held-out 512/128 ten-epoch pilot uses an isolated config and directories:
+
+```bash
+python -m llm_cdeq.prepare_cllm_states \
+  --config configs/llm_cdeq/gsm8k_wrapped_cllm_pilot.yaml \
+  --train-limit 512 --validation-limit 128 \
+  --device cuda --attention-backend sdpa
+
+python -m llm_cdeq.train_wrapped \
+  --config configs/llm_cdeq/gsm8k_wrapped_cllm_pilot.yaml \
+  --init 0 --ct 0 --epochs 10 --device cuda
+
+python -m llm_cdeq.evaluate_wrapped \
+  --config configs/llm_cdeq/gsm8k_wrapped_cllm_pilot.yaml \
+  --checkpoint /home/ljc/experiments/cllm-cdeq/\
+wrapped-official-cllm-512x128-10ep-seed42/best.pt \
+  --mode both --weights both --sample-limit 8 --device cuda
+```
+
+Fresh training refuses a non-empty output directory. Resume only from the same
+run's complete `last.pt`; `--epochs 10` remains the total target, not ten more
+epochs. The first evaluator uses full-prefix re-prefill after each committed
+block and is therefore a correctness harness, not a fair speed benchmark.
+
+The 2026-08-02 pilot completed 10 epochs/640 steps on a disjoint 512/128 cache.
+EMA passed every held-out cache gate: endpoint error improved 24.32%, token
+agreement changed from 70.70% to 70.12%, and safety/EOS/repetition violations
+were zero. The eight-question correctness smoke then scored 6/8 for the
+963-backbone-call official fixed point, but 0/8 for official one-step, wrapped
+online, and wrapped EMA. Wrapped online/EMA repeated within blocks on 7/8 and
+8/8 questions respectively, while held-out exact block match remained 0.78%.
+The engineering path is validated, but this Base one-step model is not an
+end-to-end quality pass; Init/CT remains disabled pending a stronger Base.
 
 The following commands are preserved only for reproducing the failed MLP-only
 diagnostic and its checkpoints:

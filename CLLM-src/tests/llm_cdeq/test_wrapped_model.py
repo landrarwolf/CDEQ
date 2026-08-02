@@ -126,3 +126,16 @@ def test_initializer_runs_only_on_first_round_and_every_round_reruns_backbone():
     assert total_corrector_nfe == 3
     assert total_initializer_nfe == 1
     assert not any(parameter.requires_grad for parameter in wrapper.cllm_step.parameters())
+
+
+def test_wrapper_bridges_bfloat16_backbone_and_float32_corrector():
+    wrapper = make_wrapper()
+    wrapper.cllm_step.model.to(torch.bfloat16)
+    with torch.no_grad():
+        torch.nn.init.normal_(wrapper.corrector.up.weight, std=1e-3)
+    prefill, current = inputs(wrapper)
+    output = wrapper(prefill, current, torch.tensor(0.0), round_index=0)
+    assert output.base.canonical_hidden.dtype == torch.bfloat16
+    assert output.hidden.dtype == torch.float32
+    assert output.logits.dtype == torch.float32
+    assert output.tokens.dtype == torch.long

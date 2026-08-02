@@ -14,7 +14,7 @@ from tqdm import tqdm
 from .cllm_cache import OFFICIAL_CLLM_CACHE_SCHEMA, write_official_shard
 from .cllm_step import OFFICIAL_CLLM_ID, OfficialCLLMSingleStep, parameter_checksum
 from .config import config_digest, load_config, public_config, resolve_repo_path
-from .runtime import eos_mask, iter_json_array, stable_hash, unbatch_ids
+from .runtime import eos_mask, iter_json_array, split_for_data_id, stable_hash, unbatch_ids
 from .time import rho_time_grid
 
 
@@ -27,7 +27,9 @@ def parse_args() -> argparse.Namespace:
         description="Build canonical hidden trajectories from the official CLLM operator"
     )
     parser.add_argument("--config", required=True)
-    parser.add_argument("--limit", type=int, default=64)
+    parser.add_argument("--limit", type=int)
+    parser.add_argument("--train-limit", type=int)
+    parser.add_argument("--validation-limit", type=int)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--attention-backend", choices=("flash_attention_2", "sdpa"))
     parser.add_argument("--overwrite", action="store_true")
@@ -162,10 +164,65 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+class OfficialSplitWriter:
+    def __init__(self, root: Path, split: str, shard_size: int):
+        self.root = root / split
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.split = split
+        self.shard_size = shard_size
+        self.records: list[dict[str, torch.Tensor]] = []
+        self.metadata: list[dict[str, Any]] = []
+        self.shards: list[dict[str, Any]] = []
+        self.count = 0
+        self.metadata_path = self.root / "metadata.jsonl"
+        self.metadata_handle = self.metadata_path.open("w", encoding="utf-8")
+
+    def add(self, record: dict[str, torch.Tensor], metadata: dict[str, Any]) -> None:
+        self.records.append(record)
+        self.metadata.append(metadata)
+        if len(self.records) >= self.shard_size:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self.records:
+            return
+        shard_name = f"shard-{len(self.shards):05d}.safetensors"
+        shard_path = self.root / shard_name
+        tensors = {
+            key: torch.stack([record[key] for record in self.records])
+            for key in self.records[0]
+        }
+        write_official_shard(shard_path, tensors)
+        for item in self.metadata:
+            self.metadata_handle.write(json.dumps(item, separators=(",", ":")) + "\n")
+        count = len(self.records)
+        self.shards.append(
+            {"file": shard_name, "count": count, "sha256": _sha256(shard_path)}
+        )
+        self.count += count
+        self.records.clear()
+        self.metadata.clear()
+
+    def close(self, common: dict[str, Any]) -> Path:
+        self.flush()
+        self.metadata_handle.close()
+        manifest = {
+            **common,
+            "split": self.split,
+            "count": self.count,
+            "shards": self.shards,
+            "metadata_file": self.metadata_path.name,
+            "metadata_sha256": _sha256(self.metadata_path),
+        }
+        manifest_path = self.root / "manifest.json"
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        return manifest_path
+
+
 def main() -> None:
     args = parse_args()
-    if args.limit <= 0:
-        raise ValueError("limit must be positive")
     config = load_config(args.config)
     if config["model"].get("operator") != "official_cllm":
         raise ValueError("prepare_cllm_states requires model.operator=official_cllm")
@@ -173,12 +230,27 @@ def main() -> None:
     if expected_id != OFFICIAL_CLLM_ID:
         raise ValueError(f"official CLLM id must be {OFFICIAL_CLLM_ID!r}")
 
+    training = config["training"]
+    if args.limit is not None and (
+        args.train_limit is not None or args.validation_limit is not None
+    ):
+        raise ValueError("--limit cannot be combined with split-specific limits")
+    if args.limit is not None:
+        train_limit, validation_limit = args.limit, 0
+    else:
+        train_limit = args.train_limit or int(training["train_limit"])
+        validation_limit = (
+            args.validation_limit
+            if args.validation_limit is not None
+            else int(training.get("validation_limit", 0))
+        )
+    if train_limit <= 0 or validation_limit < 0:
+        raise ValueError("train limit must be positive and validation limit non-negative")
+
     cache_root = resolve_repo_path(config, config["paths"]["cache_dir"])
     if cache_root.exists() and any(cache_root.iterdir()) and not args.overwrite:
         raise FileExistsError(f"cache directory is not empty: {cache_root}")
     cache_root.mkdir(parents=True, exist_ok=True)
-    split_root = cache_root / "train"
-    split_root.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device)
     attention_backend = args.attention_backend or config["evaluation"]["attention_backend"]
     model_path = resolve_repo_path(config, config["paths"]["cllm_model"])
@@ -196,40 +268,33 @@ def main() -> None:
 
     max_states = int(config["model"]["max_trajectory_states"])
     source = resolve_repo_path(config, config["paths"]["trajectory_json"])
-    shard_size = int(config["training"]["shard_size"])
-    accepted: list[dict[str, torch.Tensor]] = []
-    metadata: list[dict[str, Any]] = []
-    shards: list[dict[str, Any]] = []
-    seen_data_ids: set[str] = set()
+    shard_size = int(training["shard_size"])
+    split_names = ("train", "validation") if validation_limit else ("train",)
+    writers = {
+        split: OfficialSplitWriter(cache_root, split, shard_size) for split in split_names
+    }
+    limits = {"train": train_limit, "validation": validation_limit}
+    accepted = {"train": 0, "validation": 0}
+    accepted_data_ids = {"train": set(), "validation": set()}
     rejected: dict[str, int] = {}
-    metadata_path = split_root / "metadata.jsonl"
-    metadata_handle = metadata_path.open("w", encoding="utf-8")
-
-    def flush() -> None:
-        if not accepted:
-            return
-        shard_name = f"shard-{len(shards):05d}.safetensors"
-        shard_path = split_root / shard_name
-        tensors = {
-            key: torch.stack([record[key] for record in accepted])
-            for key in accepted[0]
-        }
-        write_official_shard(shard_path, tensors)
-        for item in metadata:
-            metadata_handle.write(json.dumps(item, separators=(",", ":")) + "\n")
-        shards.append(
-            {"file": shard_name, "count": len(accepted), "sha256": _sha256(shard_path)}
-        )
-        accepted.clear()
-        metadata.clear()
-
-    progress = tqdm(total=args.limit, desc="official CLLM blocks")
+    validation_fraction = validation_limit / (train_limit + validation_limit)
+    progress = tqdm(total=train_limit + validation_limit, desc="official CLLM blocks")
     for source_index, raw in enumerate(iter_json_array(source)):
-        if len(seen_data_ids) >= args.limit:
+        if accepted["train"] >= train_limit and accepted["validation"] >= validation_limit:
             break
         try:
             example = normalize_initial_example(raw, operator.block_size)
-            if example["data_id"] in seen_data_ids:
+            split = (
+                split_for_data_id(
+                    example["data_id"], int(training["seed"]), validation_fraction
+                )
+                if validation_limit
+                else "train"
+            )
+            if (
+                accepted[split] >= limits[split]
+                or example["data_id"] in accepted_data_ids[split]
+            ):
                 continue
             record, item = encode_official_trajectory(
                 operator,
@@ -246,29 +311,32 @@ def main() -> None:
             rejected[key] = rejected.get(key, 0) + 1
             continue
         item["source_index"] = source_index
-        seen_data_ids.add(example["data_id"])
-        accepted.append(record)
-        metadata.append(item)
+        item["split"] = split
+        accepted_data_ids[split].add(example["data_id"])
+        accepted[split] += 1
+        writers[split].add(record, item)
         progress.update(1)
-        if len(accepted) >= shard_size:
-            flush()
+        progress.set_postfix(train=accepted["train"], validation=accepted["validation"])
     progress.close()
-    flush()
-    metadata_handle.close()
-    if len(seen_data_ids) != args.limit:
+    if accepted != limits:
         raise RuntimeError(
-            f"built only {len(seen_data_ids)} of {args.limit} requested official CLLM blocks"
+            f"could not fill requested official CLLM splits: {accepted} != {limits}"
         )
 
-    manifest = {
+    overlap = accepted_data_ids["train"] & accepted_data_ids["validation"]
+    if overlap:
+        raise RuntimeError("official CLLM train/validation data_id overlap")
+    split_hash = stable_hash(
+        sorted(
+            (data_id, split)
+            for split, data_ids in accepted_data_ids.items()
+            for data_id in data_ids
+        )
+    )
+    common = {
         "schema_version": OFFICIAL_CLLM_CACHE_SCHEMA,
         "operator": "official_cllm",
         "created_unix": time.time(),
-        "split": "train",
-        "count": len(seen_data_ids),
-        "shards": shards,
-        "metadata_file": metadata_path.name,
-        "metadata_sha256": _sha256(metadata_path),
         "lm_head_file": "../lm_head.safetensors",
         "lm_head_sha256": _sha256(cache_root / "lm_head.safetensors"),
         "shape": {
@@ -290,16 +358,17 @@ def main() -> None:
         "eos_token_id": operator.model.config.eos_token_id,
         "config": public_config(config),
         "config_digest": config_digest(config),
-        "data_split_hash": stable_hash(sorted(seen_data_ids)),
+        "data_split_hash": split_hash,
+        "split_counts": accepted,
+        "data_id_overlap": 0,
         "rejected": rejected,
     }
-    manifest_path = split_root / "manifest.json"
-    manifest_path.write_text(
-        json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
+    manifests = {split: str(writer.close(common)) for split, writer in writers.items()}
     summary = {
-        "manifest": str(manifest_path),
-        "accepted": len(seen_data_ids),
+        "manifests": manifests,
+        "accepted": accepted,
+        "data_id_overlap": 0,
+        "data_split_hash": split_hash,
         "rejected": rejected,
         "alignment": 1.0,
         "backbone_checksum": checksum_before,

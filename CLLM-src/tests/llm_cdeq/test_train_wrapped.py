@@ -1,13 +1,18 @@
 import copy
 
+import pytest
 import torch
 
+from llm_cdeq.config import config_digest
 from llm_cdeq.corrector import TransformerResidualCorrector
 from llm_cdeq.train_wrapped import (
     WrappedMetrics,
     gate_results,
     load_wrapped_checkpoint,
+    prepare_output_dir,
     save_wrapped_checkpoint,
+    validate_cache_pair,
+    validate_resume_history,
     wrapped_train_step,
 )
 
@@ -115,11 +120,18 @@ def test_wrapped_checkpoint_round_trip_contains_full_metadata(tmp_path):
         manifest,
         metrics,
         global_step=7,
+        epoch=2,
+        best_endpoint_relative_error=0.5,
+        ema_metrics=metrics,
     )
     restored = copy.deepcopy(corrector)
     package = load_wrapped_checkpoint(path, restored)
     assert package["schema_version"] == "llm_cdeq_wrapped_checkpoint_v1"
     assert package["operator"] == "official_cllm"
+    assert package["epoch"] == 2
+    assert package["epoch_complete"] is True
+    assert package["validation_metrics"]["endpoint_relative_error"] == 0.5
+    assert package["ema_validation_metrics"]["endpoint_relative_error"] == 0.5
     assert package["backbone_checksum_before"] == package["backbone_checksum_after"]
     for expected, actual in zip(corrector.parameters(), restored.parameters()):
         torch.testing.assert_close(expected, actual)
@@ -128,3 +140,46 @@ def test_wrapped_checkpoint_round_trip_contains_full_metadata(tmp_path):
 def test_gate_requires_all_fixed_acceptance_conditions():
     metrics = WrappedMetrics(0.7, 1.0, 0.3, 0.59, 0.6, 0.1, 0.1, 0.05, 0.0, 0.0, 64)
     assert all(gate_results(metrics, config()).values())
+
+
+def test_output_directory_refuses_accidental_overwrite(tmp_path):
+    output = tmp_path / "run"
+    output.mkdir()
+    (output / "history.jsonl").write_text("old\n", encoding="utf-8")
+    with pytest.raises(FileExistsError, match="refusing to overwrite"):
+        prepare_output_dir(output, resume=False)
+    prepare_output_dir(output, resume=True)
+    with pytest.raises(FileNotFoundError, match="does not exist"):
+        prepare_output_dir(tmp_path / "missing", resume=True)
+
+
+def test_train_and_validation_cache_contract_must_match():
+    common = {
+        "schema_version": "llm_cdeq_official_cllm_hidden_cache_v1",
+        "operator": "official_cllm",
+        "data_split_hash": "split",
+        "backbone_checksum": "backbone",
+        "cllm_model_id": "cllm/consistency-llm-7b-math",
+        "cllm_model_revision": "revision",
+        "config_digest": config_digest(config()),
+        "data_id_overlap": 0,
+    }
+
+    class Dataset:
+        def __init__(self, manifest):
+            self.manifest = manifest
+
+    train = Dataset({**common, "split": "train"})
+    validation = Dataset({**common, "split": "validation"})
+    validate_cache_pair(train, validation, config())
+    validation.manifest["data_split_hash"] = "other"
+    with pytest.raises(ValueError, match="data_split_hash"):
+        validate_cache_pair(train, validation, config())
+
+
+def test_resume_checkpoint_must_match_history_tail(tmp_path):
+    history = tmp_path / "history.jsonl"
+    history.write_text('{"epoch":2,"global_step":24}\n', encoding="utf-8")
+    validate_resume_history(history, {"epoch": 2, "global_step": 24})
+    with pytest.raises(ValueError, match="history tail"):
+        validate_resume_history(history, {"epoch": 1, "global_step": 16})

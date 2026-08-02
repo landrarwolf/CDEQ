@@ -46,8 +46,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--init", type=int, choices=(0, 1), default=0)
     parser.add_argument("--ct", type=int, choices=(0, 1), default=0)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--epochs", type=int)
     parser.add_argument("--max-steps", type=int)
     parser.add_argument("--output-dir")
+    parser.add_argument("--resume")
+    parser.add_argument("--overfit", action="store_true")
     return parser.parse_args()
 
 
@@ -251,6 +254,11 @@ def save_wrapped_checkpoint(
     metrics: WrappedMetrics,
     *,
     global_step: int,
+    epoch: int = -1,
+    epoch_complete: bool = True,
+    best_endpoint_relative_error: float | None = None,
+    best_metrics: WrappedMetrics | None = None,
+    ema_metrics: WrappedMetrics | None = None,
 ) -> None:
     trainable = corrector_parameter_count(corrector)
     backbone = int(manifest["backbone_parameter_count"])
@@ -271,8 +279,17 @@ def save_wrapped_checkpoint(
         "backbone_checksum_before": manifest["backbone_checksum"],
         "backbone_checksum_after": manifest["backbone_checksum"],
         "backbone_checksum_evidence": "frozen official CLLM is read-only and absent from optimizer",
-        "best_validation_metrics": asdict(metrics),
+        "validation_metrics": asdict(metrics),
+        "best_validation_metrics": asdict(best_metrics or metrics),
+        "ema_validation_metrics": asdict(ema_metrics) if ema_metrics else None,
         "global_step": global_step,
+        "epoch": epoch,
+        "epoch_complete": epoch_complete,
+        "best_endpoint_relative_error": (
+            metrics.endpoint_relative_error
+            if best_endpoint_relative_error is None
+            else best_endpoint_relative_error
+        ),
         "use_initializer": False,
         "use_continuous_time": False,
     }
@@ -300,6 +317,57 @@ def load_wrapped_checkpoint(
     return package
 
 
+def validate_cache_pair(
+    train_dataset: OfficialCLLMTrajectoryDataset,
+    validation_dataset: OfficialCLLMTrajectoryDataset,
+    config: Mapping[str, Any],
+) -> None:
+    train_manifest = train_dataset.manifest
+    validation_manifest = validation_dataset.manifest
+    if train_manifest.get("split") != "train":
+        raise ValueError("training manifest is not labeled train")
+    if validation_manifest.get("split") != "validation":
+        raise ValueError("validation manifest is not labeled validation")
+    for key in (
+        "schema_version",
+        "operator",
+        "data_split_hash",
+        "backbone_checksum",
+        "cllm_model_id",
+        "cllm_model_revision",
+    ):
+        if train_manifest.get(key) != validation_manifest.get(key):
+            raise ValueError(f"train/validation cache mismatch for {key}")
+    if train_manifest.get("config_digest") != config_digest(config):
+        raise ValueError("cache and training config digests do not match")
+    if int(train_manifest.get("data_id_overlap", -1)) != 0:
+        raise ValueError("official CLLM cache reports train/validation leakage")
+
+
+def prepare_output_dir(path: Path, *, resume: bool) -> None:
+    if resume:
+        if not path.is_dir():
+            raise FileNotFoundError(f"resume output directory does not exist: {path}")
+        return
+    if path.exists() and any(path.iterdir()):
+        raise FileExistsError(f"refusing to overwrite non-empty output directory: {path}")
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def validate_resume_history(history_path: Path, package: Mapping[str, Any]) -> None:
+    if not history_path.is_file():
+        raise FileNotFoundError("resume history.jsonl is missing")
+    lines = history_path.read_text(encoding="utf-8").splitlines()
+    if not lines:
+        raise ValueError("resume history.jsonl is empty")
+    tail = json.loads(lines[-1])
+    if (
+        int(tail.get("epoch", -1)) != int(package.get("epoch", -2))
+        or int(tail.get("global_step", -1)) != int(package.get("global_step", -2))
+    ):
+        raise ValueError("resume checkpoint does not match the history tail")
+
+
 def main() -> None:
     args = parse_args()
     if args.init or args.ct:
@@ -309,21 +377,38 @@ def main() -> None:
     config = load_config(args.config)
     if config["model"].get("operator") != "official_cllm":
         raise ValueError("train_wrapped requires model.operator=official_cllm")
+    if args.epochs is not None and args.epochs <= 0:
+        raise ValueError("epochs must be positive")
+    if args.max_steps is not None and args.max_steps <= 0:
+        raise ValueError("max steps must be positive")
     seed_everything(int(config["training"]["seed"]))
     device = torch.device(args.device)
     cache_root = resolve_repo_path(config, config["paths"]["cache_dir"])
-    dataset = OfficialCLLMTrajectoryDataset(cache_root / "train" / "manifest.json")
-    if dataset.manifest["cllm_model_id"] != "cllm/consistency-llm-7b-math":
+    train_dataset = OfficialCLLMTrajectoryDataset(cache_root / "train" / "manifest.json")
+    if args.overfit:
+        validation_dataset = train_dataset
+    else:
+        validation_manifest = cache_root / "validation" / "manifest.json"
+        if not validation_manifest.is_file():
+            raise FileNotFoundError(
+                "wrapped training requires a held-out validation manifest; "
+                "use --overfit only for an explicit train-set gate"
+            )
+        validation_dataset = OfficialCLLMTrajectoryDataset(validation_manifest)
+        validate_cache_pair(train_dataset, validation_dataset, config)
+    if train_dataset.manifest["cllm_model_id"] != "cllm/consistency-llm-7b-math":
         raise ValueError("wrapped training cache was not generated by official CLLM")
-    if float(dataset.manifest["cache_hidden_token_alignment"]) != 1.0:
+    if float(train_dataset.manifest["cache_hidden_token_alignment"]) != 1.0:
         raise ValueError("official CLLM cache alignment is not 100%")
+    if float(validation_dataset.manifest["cache_hidden_token_alignment"]) != 1.0:
+        raise ValueError("official CLLM validation cache alignment is not 100%")
 
     corrector = build_corrector(config).to(device=device, dtype=torch.float32)
     ema = copy.deepcopy(corrector).eval()
     for parameter in ema.parameters():
         parameter.requires_grad_(False)
     trainable = corrector_parameter_count(corrector)
-    backbone = int(dataset.manifest["backbone_parameter_count"])
+    backbone = int(train_dataset.manifest["backbone_parameter_count"])
     if trainable / backbone >= 0.01:
         raise ValueError("corrector exceeds the 1% backbone parameter gate")
     lm_head_weight = load_file(
@@ -336,40 +421,90 @@ def main() -> None:
         lr=float(training["learning_rate"]),
         weight_decay=float(training["weight_decay"]),
     )
-    max_steps = min(
-        int(args.max_steps or training["max_optimizer_steps"]),
-        int(training["max_optimizer_steps"]),
+    batch_size = int(training["batch_size"])
+    steps_per_epoch = sum(
+        math.ceil(int(shard["count"]) / batch_size)
+        for shard in train_dataset.manifest["shards"]
     )
-    output_dir = Path(args.output_dir) if args.output_dir else resolve_repo_path(
-        config, config["paths"]["output_dir"]
-    )
-    output_dir.mkdir(parents=True, exist_ok=True)
+    configured_epochs = training.get("epochs")
+    max_steps = args.max_steps
+    if args.epochs is not None:
+        epochs = args.epochs
+    elif configured_epochs is not None:
+        epochs = int(configured_epochs)
+    else:
+        if max_steps is None:
+            max_steps = int(training["max_optimizer_steps"])
+        epochs = math.ceil(max_steps / steps_per_epoch)
+
+    resume_path = Path(args.resume).resolve() if args.resume else None
+    if args.output_dir:
+        output_dir = Path(args.output_dir).resolve()
+    elif resume_path is not None:
+        output_dir = resume_path.parent
+    else:
+        output_dir = resolve_repo_path(config, config["paths"]["output_dir"]).resolve()
+    if resume_path is not None and resume_path.parent != output_dir:
+        raise ValueError("resume checkpoint and output directory must have the same parent")
+    if resume_path is not None and resume_path.name != "last.pt":
+        raise ValueError("epoch resume requires the run's last.pt checkpoint")
+    prepare_output_dir(output_dir, resume=resume_path is not None)
     history_path = output_dir / "history.jsonl"
-    generator = torch.Generator(device=device).manual_seed(int(training["seed"]))
     global_step = 0
     best_error = math.inf
-    bad_validations = 0
-    baseline_metrics = evaluate_wrapped_cache(
-        corrector,
-        dataset,
-        lm_head_weight,
-        device=device,
-        batch_size=int(training["batch_size"]),
-    )
-    (output_dir / "initial_metrics.json").write_text(
-        json.dumps(asdict(baseline_metrics), indent=2, sort_keys=True) + "\n",
-        encoding="utf-8",
-    )
-    print(json.dumps({"initial": asdict(baseline_metrics)}, sort_keys=True))
-
-    while global_step < max_steps and bad_validations < int(training["patience"]):
-        corrector.train()
-        epoch_generator = torch.Generator().manual_seed(
-            int(training["seed"]) + global_step
+    best_metrics: WrappedMetrics | None = None
+    start_epoch = 0
+    if resume_path is not None:
+        package = load_wrapped_checkpoint(
+            resume_path, corrector, ema, optimizer=optimizer
         )
-        for raw_batch in dataset.iter_batches(
-            int(training["batch_size"]), shuffle=True, generator=epoch_generator
+        if package.get("config_digest") != config_digest(config):
+            raise ValueError("resume checkpoint and training config digests do not match")
+        if package.get("data_split_hash") != train_dataset.manifest["data_split_hash"]:
+            raise ValueError("resume checkpoint and cache split hashes do not match")
+        if not package.get("epoch_complete", False):
+            raise ValueError("cannot resume a checkpoint saved during a partial epoch")
+        if int(package.get("epoch", -1)) < 0:
+            raise ValueError("resume checkpoint does not contain an epoch cursor")
+        validate_resume_history(history_path, package)
+        start_epoch = int(package["epoch"]) + 1
+        global_step = int(package["global_step"])
+        best_error = float(package["best_endpoint_relative_error"])
+        best_metrics = WrappedMetrics(**package["best_validation_metrics"])
+    else:
+        baseline_online = evaluate_wrapped_cache(
+            corrector,
+            validation_dataset,
+            lm_head_weight,
+            device=device,
+            batch_size=batch_size,
+        )
+        baseline_ema = evaluate_wrapped_cache(
+            ema,
+            validation_dataset,
+            lm_head_weight,
+            device=device,
+            batch_size=batch_size,
+        )
+        initial = {"online": asdict(baseline_online), "ema": asdict(baseline_ema)}
+        (output_dir / "initial_metrics.json").write_text(
+            json.dumps(initial, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        print(json.dumps({"initial": initial}, sort_keys=True))
+
+    completed_epoch = start_epoch - 1
+    for epoch in range(start_epoch, epochs):
+        corrector.train()
+        epoch_seed = int(training["seed"]) + epoch
+        epoch_generator = torch.Generator().manual_seed(epoch_seed)
+        pair_generator = torch.Generator(device=device).manual_seed(epoch_seed)
+        totals: dict[str, float] = {}
+        processed_batches = 0
+        for raw_batch in train_dataset.iter_batches(
+            batch_size, shuffle=True, generator=epoch_generator
         ):
+            if max_steps is not None and global_step >= max_steps:
+                break
             batch = move_batch(raw_batch, device, floating_dtype=torch.float32)
             optimizer.zero_grad(set_to_none=True)
             loss, parts = wrapped_train_step(
@@ -378,7 +513,7 @@ def main() -> None:
                 batch,
                 lm_head_weight,
                 config,
-                generator=generator,
+                generator=pair_generator,
             )
             if not bool(torch.isfinite(loss)):
                 raise FloatingPointError("wrapped corrector training produced a non-finite loss")
@@ -389,77 +524,124 @@ def main() -> None:
             optimizer.step()
             update_ema_(ema, corrector, float(training["ema_decay"]))
             global_step += 1
-            record: dict[str, Any] = {
-                "global_step": global_step,
-                "loss": float(loss.detach()),
-                **parts,
-            }
-            if global_step % int(training["validation_interval"]) == 0 or global_step == max_steps:
-                metrics = evaluate_wrapped_cache(
-                    corrector,
-                    dataset,
-                    lm_head_weight,
-                    device=device,
-                    batch_size=int(training["batch_size"]),
-                )
-                record["validation"] = asdict(metrics)
-                save_wrapped_checkpoint(
-                    output_dir / "last.pt",
-                    corrector,
-                    ema,
-                    optimizer,
-                    config,
-                    dataset.manifest,
-                    metrics,
-                    global_step=global_step,
-                )
-                if metrics.endpoint_relative_error < best_error:
-                    best_error = metrics.endpoint_relative_error
-                    bad_validations = 0
-                    save_wrapped_checkpoint(
-                        output_dir / "best.pt",
-                        corrector,
-                        ema,
-                        optimizer,
-                        config,
-                        dataset.manifest,
-                        metrics,
-                        global_step=global_step,
-                    )
-                else:
-                    bad_validations += 1
-            with history_path.open("a", encoding="utf-8") as handle:
-                handle.write(json.dumps(record, sort_keys=True) + "\n")
-            print(json.dumps(record, sort_keys=True))
-            if global_step >= max_steps or bad_validations >= int(training["patience"]):
-                break
+            processed_batches += 1
+            values = {"loss": float(loss.detach()), **parts}
+            for key, value in values.items():
+                totals[key] = totals.get(key, 0.0) + value
+        if processed_batches == 0:
+            break
 
-    package = torch.load(output_dir / "best.pt", map_location="cpu", weights_only=False)
+        epoch_complete = processed_batches == steps_per_epoch
+        online_metrics = evaluate_wrapped_cache(
+            corrector,
+            validation_dataset,
+            lm_head_weight,
+            device=device,
+            batch_size=batch_size,
+        )
+        ema_metrics = evaluate_wrapped_cache(
+            ema,
+            validation_dataset,
+            lm_head_weight,
+            device=device,
+            batch_size=batch_size,
+        )
+        improved = online_metrics.endpoint_relative_error < best_error
+        if improved:
+            best_metrics = online_metrics
+        best_error = min(best_error, online_metrics.endpoint_relative_error)
+        record = {
+            "epoch": epoch,
+            "epoch_number": epoch + 1,
+            "epoch_complete": epoch_complete,
+            "global_step": global_step,
+            "train": {key: value / processed_batches for key, value in totals.items()},
+            "validation": {
+                "online": asdict(online_metrics),
+                "ema": asdict(ema_metrics),
+            },
+        }
+        save_wrapped_checkpoint(
+            output_dir / "last.pt",
+            corrector,
+            ema,
+            optimizer,
+            config,
+            train_dataset.manifest,
+            online_metrics,
+            global_step=global_step,
+            epoch=epoch,
+            epoch_complete=epoch_complete,
+            best_endpoint_relative_error=best_error,
+            best_metrics=best_metrics,
+            ema_metrics=ema_metrics,
+        )
+        if improved:
+            save_wrapped_checkpoint(
+                output_dir / "best.pt",
+                corrector,
+                ema,
+                optimizer,
+                config,
+                train_dataset.manifest,
+                online_metrics,
+                global_step=global_step,
+                epoch=epoch,
+                epoch_complete=epoch_complete,
+                best_endpoint_relative_error=best_error,
+                best_metrics=best_metrics,
+                ema_metrics=ema_metrics,
+            )
+        with history_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+        print(json.dumps(record, sort_keys=True))
+        completed_epoch = epoch
+        if max_steps is not None and global_step >= max_steps:
+            break
+
+    best_path = output_dir / "best.pt"
+    if not best_path.is_file():
+        raise RuntimeError("training did not produce best.pt")
+    package = torch.load(best_path, map_location="cpu", weights_only=False)
     corrector.load_state_dict(package["corrector_state"])
-    final_metrics = evaluate_wrapped_cache(
+    ema.load_state_dict(package["ema_state"])
+    final_online = evaluate_wrapped_cache(
         corrector,
-        dataset,
+        validation_dataset,
         lm_head_weight,
         device=device,
-        batch_size=int(training["batch_size"]),
+        batch_size=batch_size,
     )
-    gates = gate_results(final_metrics, config)
+    final_ema = evaluate_wrapped_cache(
+        ema,
+        validation_dataset,
+        lm_head_weight,
+        device=device,
+        batch_size=batch_size,
+    )
+    online_gates = gate_results(final_online, config)
+    ema_gates = gate_results(final_ema, config)
     report = {
         "schema_version": WRAPPED_CHECKPOINT_SCHEMA,
+        "requested_epochs": epochs,
+        "completed_epochs": max(completed_epoch + 1, start_epoch),
         "global_step": global_step,
-        "stopped_by_patience": bad_validations >= int(training["patience"]),
-        "metrics": asdict(final_metrics),
-        "gates": gates,
-        "all_gates_passed": all(gates.values()),
-        "long_training_allowed": False,
+        "overfit": bool(args.overfit),
+        "metrics": {"online": asdict(final_online), "ema": asdict(final_ema)},
+        "gates": {"online": online_gates, "ema": ema_gates},
+        "all_gates_passed": {
+            "online": all(online_gates.values()),
+            "ema": all(ema_gates.values()),
+        },
+        "next_phase_allowed": all(online_gates.values()) or all(ema_gates.values()),
         "trainable_parameter_count": trainable,
         "backbone_parameter_count": backbone,
         "trainable_fraction": trainable / backbone,
-        "backbone_checksum_before": dataset.manifest["backbone_checksum"],
-        "backbone_checksum_after": dataset.manifest["backbone_checksum"],
+        "backbone_checksum_before": train_dataset.manifest["backbone_checksum"],
+        "backbone_checksum_after": train_dataset.manifest["backbone_checksum"],
         "history_sha256": stable_hash(history_path.read_text(encoding="utf-8")),
     }
-    (output_dir / "gate_report.json").write_text(
+    (output_dir / "training_report.json").write_text(
         json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
     print(json.dumps(report, indent=2, sort_keys=True))

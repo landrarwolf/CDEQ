@@ -96,7 +96,8 @@ class WrappedCLLM(nn.Module):
                 hidden = torch.cat((base.canonical_hidden[:, :1], hidden[:, 1:]), dim=1)
                 initializer_nfe = 1
             started = wall_time.perf_counter()
-            hidden = self.corrector(hidden, time)
+            corrector_dtype = next(self.corrector.parameters()).dtype
+            hidden = self.corrector(hidden.to(dtype=corrector_dtype), time)
             if bool(boundary.any()):
                 # A mixed-time batch must preserve the official CLLM hidden on
                 # every terminal row/token even if other samples use Init.
@@ -105,7 +106,7 @@ class WrappedCLLM(nn.Module):
                 )
             corrector_latency = wall_time.perf_counter() - started
             corrector_nfe = 1
-        logits = self.lm_head(hidden).float()
+        logits = self.lm_head(hidden.to(dtype=self.lm_head.weight.dtype)).float()
         tokens = logits.argmax(dim=-1)
         return WrappedStepOutput(
             base=base,
