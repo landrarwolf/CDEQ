@@ -193,8 +193,8 @@ def train_step(
         )
 
     with torch.no_grad():
-        adjacent_target = ema.consistency(earlier, earlier_t)
-    adjacent_prediction = adapter.consistency(later, later_t)
+        adjacent_target = ema.consistency(later, later_t)
+    adjacent_prediction = adapter.consistency(earlier, earlier_t)
     local_loss = _masked_mse(adjacent_prediction, adjacent_target, token_mask)
     endpoint_prediction = adapter.consistency(earlier, earlier_t)
     endpoint_loss = _masked_smooth_l1(endpoint_prediction, endpoint, token_mask)

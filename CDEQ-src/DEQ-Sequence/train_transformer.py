@@ -755,11 +755,11 @@ def train_on_trajectory(
                         z_init = init_model(current_func_args[0][:, :, -qlen:]).detach()
 
                 with torch.no_grad():
-                    out_tn = cd_ema(x_tn, x_tn_prev, tn.unsqueeze(0).expand(x_tn.size(0), -1), current_func_args)
+                    out_tn_1 = cd_ema(x_tn_1, x_tn, tn_1.unsqueeze(0).expand(x_tn_1.size(0), -1), current_func_args)
                 optimizer.zero_grad()
                 loss_1 = F.mse_loss(
-                    cd(x_tn_1, x_tn, tn_1.unsqueeze(0).expand(x_tn.size(0), -1), current_func_args),
-                    out_tn,
+                    cd(x_tn, x_tn_prev, tn.unsqueeze(0).expand(x_tn.size(0), -1), current_func_args),
+                    out_tn_1,
                 )
                 x_endpoint_steps = x_endpoint.unsqueeze(1).expand(-1, n_steps, -1, -1)
                 loss_2_x = cd(x_tn, x_tn_prev, tn.unsqueeze(0).expand(x_tn.size(0), -1), current_func_args)

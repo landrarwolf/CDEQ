@@ -60,6 +60,44 @@ def test_all_ablation_training_steps_are_finite(use_initializer, use_ct):
     assert any(parameter.grad is not None for parameter in adapter.consistency_parameters())
 
 
+def test_local_teacher_is_closer_to_endpoint():
+    class RecordingAdapter(torch.nn.Module):
+        use_initializer = False
+
+        def __init__(self):
+            super().__init__()
+            self.scale = torch.nn.Parameter(torch.tensor(0.25))
+            self.calls = []
+
+        def consistency(self, state, time):
+            self.calls.append((state.detach().clone(), time.detach().clone()))
+            return state + self.scale * (1 - time[:, None, None] / 5.0)
+
+    sample = make_batch()
+    student = RecordingAdapter()
+    teacher = RecordingAdapter()
+    teacher.load_state_dict(student.state_dict())
+    teacher.requires_grad_(False)
+    config = {
+        "time": {"epsilon": 0.002, "terminal": 5.0, "q": 1.1, "d": 100, "k": 8, "b": 1},
+        "training": {"local_weight": 1.0, "endpoint_weight": 0.0, "token_ce_weight": 0.0},
+    }
+    loss, _ = train_step(
+        student,
+        teacher,
+        sample,
+        config,
+        use_ct=False,
+        global_step=0,
+        generator=torch.Generator().manual_seed(42),
+        lm_head_weight=None,
+    )
+    loss.backward()
+    assert torch.all(teacher.calls[0][1] > student.calls[0][1])
+    assert student.scale.grad is not None
+    assert all(parameter.grad is None for parameter in teacher.parameters())
+
+
 def test_identity_cache_metrics_are_explicit():
     initial = torch.randn(2, 2, 4)
     states = torch.stack((initial, initial), dim=1)
