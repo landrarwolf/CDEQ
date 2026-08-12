@@ -45,7 +45,7 @@ Last updated: 2026-07-03.
      - Picard: train on `f(z_t)`.
      - Anderson: train on `anderson_step(z_t, z_{t-1}, f(z_t), f(z_{t-1}))`.
    - Current distillation loss is simplified:
-     - local consistency: student output at current point matches EMA model at the previous point.
+     - local consistency: student output at the earlier point matches the stop-gradient EMA model at the later point, closer to the fixed-point endpoint.
      - global consistency: output matches the final trajectory state.
      - code uses `0.1 * local + 0.9 * global`.
 
