@@ -656,10 +656,10 @@ def train_on_trajectory(args, cd, cd_ema, params_ema, optimizer, dataloader, t_t
                 x_tn_prev = x_batch[:, np.maximum(np.array(n_1) - 2, 0).tolist()]
 
                 with torch.no_grad():
-                    out_tn = cd_ema(x_tn, x_tn_prev, tn.unsqueeze(0).expand(x_tn.size(0), -1), current_func_args)
+                    out_tn_1 = cd_ema(x_tn_1, x_tn, tn_1.unsqueeze(0).expand(x_tn_1.size(0), -1), current_func_args)
                 loss_1 = F.mse_loss(
-                    cd(x_tn_1, x_tn, tn_1.unsqueeze(0).expand(x_tn.size(0), -1), current_func_args),
-                    out_tn,
+                    cd(x_tn, x_tn_prev, tn.unsqueeze(0).expand(x_tn.size(0), -1), current_func_args),
+                    out_tn_1,
                 )
                 x_endpoint = x_batch[:, -1].unsqueeze(1).expand(-1, n_steps, -1, -1)
                 loss_2_x = cd(x_tn, x_tn_prev, tn.unsqueeze(0).expand(x_tn.size(0), -1), current_func_args)

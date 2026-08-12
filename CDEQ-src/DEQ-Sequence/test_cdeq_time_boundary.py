@@ -1,13 +1,22 @@
 from pathlib import Path
 import sys
 
+ROOT = Path(__file__).resolve().parent
+
+
+def test_local_teacher_is_closer_to_endpoint():
+    source = (ROOT / "train_transformer.py").read_text()
+    assert "out_tn_1 = cd_ema(x_tn_1, x_tn, tn_1.unsqueeze(0)" in source
+    assert "cd(x_tn, x_tn_prev, tn.unsqueeze(0)" in source
+
+
 try:
     import torch
 except ModuleNotFoundError:
+    test_local_teacher_is_closer_to_endpoint()
     print("cdeq_time_boundary=skipped_missing_torch")
     raise SystemExit(0)
 
-ROOT = Path(__file__).resolve().parent
 for path in (ROOT, ROOT.parent):
     sys.path.insert(0, str(path))
 
@@ -24,4 +33,5 @@ def test_cm_boundary_mix():
 
 if __name__ == "__main__":
     test_cm_boundary_mix()
+    test_local_teacher_is_closer_to_endpoint()
     print("cdeq_time_boundary=ok")
