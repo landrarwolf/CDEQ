@@ -5,6 +5,7 @@ import random
 import subprocess
 import sys
 import time
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -28,7 +29,7 @@ from models.deq_transformer_CD import (
     ConsistencyFunction,
     InitialStatePredictor,
     interpolate_trajectory,
-    sample_continuous_pair,
+    sample_ea_pit_pair,
 )
 from utils.data_parallel import BalancedDataParallel
 from utils.exp_utils import create_exp_dir
@@ -39,6 +40,7 @@ SOLVERS = {
 }
 
 TRAJECTORY_FORMAT_VERSION = "z0_eps_to_fixed_T_v1"
+CM_SCHEDULE_VERSION = "ea_pit_v1"
 
 
 def build_parser():
@@ -233,7 +235,7 @@ def build_parser():
     parser.add_argument("--cdeq-init-steps", type=int, default=10,
                         help="initializer optimization steps per CM batch")
     parser.add_argument("--cm-continuous-time", action="store_true",
-                        help="sample continuous (t, r) pairs for CM training")
+                        help="enable EA-PIT continuous-pair training")
     parser.add_argument("--cm-ct-q", type=float, default=1.1,
                         help="continuous-time schedule q")
     parser.add_argument("--cm-ct-d", type=int, default=100,
@@ -242,6 +244,8 @@ def build_parser():
                         help="continuous-time schedule sigmoid scale")
     parser.add_argument("--cm-ct-b", type=float, default=1.0,
                         help="continuous-time schedule sigmoid slope")
+    parser.add_argument("--cm-ct-p-end", type=float, default=0.1,
+                        help="EA-PIT Bernoulli endpoint anchoring probability")
     return parser
 
 
@@ -259,10 +263,16 @@ def parse_args(argv=None):
         parser.error("only --attn_type 0 is supported")
     if args.cm_continuous_time and args.trajectory_solver != "picard":
         parser.error("--cm-continuous-time currently supports --trajectory-solver picard")
-    if args.cm_ct_q <= 1:
+    if not math.isfinite(args.cm_ct_q) or args.cm_ct_q <= 1:
         parser.error("--cm-ct-q must be > 1")
     if args.cm_ct_d <= 0:
         parser.error("--cm-ct-d must be > 0")
+    if not math.isfinite(args.cm_ct_k) or args.cm_ct_k < 0:
+        parser.error("--cm-ct-k must be >= 0")
+    if not math.isfinite(args.cm_ct_b) or args.cm_ct_b < 0:
+        parser.error("--cm-ct-b must be >= 0")
+    if not math.isfinite(args.cm_ct_p_end) or not 0 <= args.cm_ct_p_end <= 1:
+        parser.error("--cm-ct-p-end must be in [0, 1]")
     if args.cdeq_init_lr <= 0:
         parser.error("--cdeq-init-lr must be > 0")
     if args.cdeq_init_steps <= 0:
@@ -634,7 +644,17 @@ def module_of(model):
     return model.module if hasattr(model, "module") else model
 
 
-def save_cm_package(path, cd, init_model=None, args=None, cm_global_step=0):
+def cm_ct_params(args):
+    return {
+        "q": args.cm_ct_q,
+        "d": args.cm_ct_d,
+        "k": args.cm_ct_k,
+        "b": args.cm_ct_b,
+        "p_end": args.cm_ct_p_end,
+    }
+
+
+def save_cm_package(path, cd, init_model=None, args=None, cm_global_step=0, best_rel_diff=float("inf")):
     save_dir = os.path.dirname(path)
     if save_dir:
         os.makedirs(save_dir, exist_ok=True)
@@ -642,19 +662,16 @@ def save_cm_package(path, cd, init_model=None, args=None, cm_global_step=0):
         "cm_time_convention": TRAJECTORY_FORMAT_VERSION,
         "model": module_of(cd).state_dict(),
         "cm_global_step": cm_global_step,
+        "best_rel_diff": best_rel_diff,
     }
     if args is not None:
         package["cm_method"] = "cdeq_plus" if args.cdeq_init or args.cm_continuous_time else "cdeq"
         package["cm_continuous_time"] = args.cm_continuous_time
+        package["cm_schedule_version"] = CM_SCHEDULE_VERSION if args.cm_continuous_time else None
         package["cdeq_init"] = args.cdeq_init
         package["cdeq_init_lr"] = args.cdeq_init_lr
         package["cdeq_init_steps"] = args.cdeq_init_steps
-        package["cm_ct_params"] = {
-            "q": args.cm_ct_q,
-            "d": args.cm_ct_d,
-            "k": args.cm_ct_k,
-            "b": args.cm_ct_b,
-        }
+        package["cm_ct_params"] = cm_ct_params(args)
     if init_model is not None:
         package["init_model"] = module_of(init_model).state_dict()
     torch.save(
@@ -680,6 +697,52 @@ def load_cm_package(path, device, require_init=False):
     if require_init and "init_model" not in state:
         raise ValueError(f"CM weights {path} do not contain init_model; rerun --train-CM --cdeq-init.")
     return state
+
+
+def validate_cm_checkpoint_config(checkpoint, args):
+    saved_continuous = checkpoint.get("cm_continuous_time")
+    saved_schedule = checkpoint.get("cm_schedule_version")
+    if args.cm_continuous_time:
+        if saved_continuous is not True or saved_schedule != CM_SCHEDULE_VERSION:
+            raise ValueError(
+                "CM checkpoint is not an EA-PIT checkpoint. "
+                "Use fresh --cm-checkpoint and --cm-save paths."
+            )
+        missing = {"cm_global_step", "best_rel_diff", "cdeq_init"} - checkpoint.keys()
+        if missing:
+            raise ValueError(f"EA-PIT checkpoint is missing required fields: {sorted(missing)}")
+        if (
+            not isinstance(checkpoint["cm_global_step"], int)
+            or isinstance(checkpoint["cm_global_step"], bool)
+            or checkpoint["cm_global_step"] < 0
+        ):
+            raise ValueError("EA-PIT checkpoint cm_global_step must be a non-negative integer.")
+        if not isinstance(checkpoint["best_rel_diff"], (int, float)) or not math.isfinite(
+            checkpoint["best_rel_diff"]
+        ):
+            raise ValueError("EA-PIT checkpoint best_rel_diff must be finite.")
+        if checkpoint.get("cm_ct_params") != cm_ct_params(args):
+            raise ValueError(
+                f"EA-PIT checkpoint parameters {checkpoint.get('cm_ct_params')} do not match "
+                f"the requested parameters {cm_ct_params(args)}."
+            )
+    elif saved_continuous is True or saved_schedule == CM_SCHEDULE_VERSION:
+        raise ValueError("Cannot resume an EA-PIT checkpoint with --cm-continuous-time disabled.")
+    elif saved_continuous is None and saved_schedule is None:
+        warnings.warn(
+            "Legacy CM checkpoint has no schedule metadata; treating it as CT-off state.",
+            RuntimeWarning,
+        )
+
+    saved_init = checkpoint.get("cdeq_init")
+    if saved_init is None and ("init_model" in checkpoint or "init_optimizer" in checkpoint):
+        saved_init = True
+    if saved_init is not None and bool(saved_init) != bool(args.cdeq_init):
+        raise ValueError("CM checkpoint --cdeq-init mode does not match the requested run.")
+    if args.cdeq_init:
+        missing = {"init_model", "init_optimizer"} - checkpoint.keys()
+        if missing:
+            raise ValueError(f"CM initializer checkpoint is missing required fields: {sorted(missing)}")
 
 
 def train_on_trajectory(
@@ -712,6 +775,8 @@ def train_on_trajectory(
             indices = torch.linspace(1, n_total_steps - 1, steps=n_steps).round().long().tolist()
             n_1 = [indices[random.randint(0, len(indices) - 1)] for _ in range(n_steps)]
             epoch_rel_diffs = []
+            epoch_alphas = []
+            epoch_endpoint_rates = []
 
             for data in dataloader:
                 x_batch = data[0]
@@ -722,7 +787,7 @@ def train_on_trajectory(
                 qlen = x_batch.size(-1)
 
                 if args.cm_continuous_time:
-                    tn_1, tn = sample_continuous_pair(
+                    r, s, alpha = sample_ea_pit_pair(
                         batch_t_traj,
                         n_steps,
                         cm_global_step,
@@ -730,10 +795,12 @@ def train_on_trajectory(
                         d=args.cm_ct_d,
                         k=args.cm_ct_k,
                         b=args.cm_ct_b,
+                        p_end=args.cm_ct_p_end,
                     )
-                    x_tn_1 = interpolate_trajectory(x_batch, batch_t_traj, tn_1)
-                    x_tn = interpolate_trajectory(x_batch, batch_t_traj, tn)
-                    x_tn_prev = x_tn
+                    z_r = interpolate_trajectory(x_batch, batch_t_traj, r)
+                    z_s = interpolate_trajectory(x_batch, batch_t_traj, s)
+                    epoch_alphas.append(alpha.mean().item())
+                    epoch_endpoint_rates.append((s == batch_t_traj[-1]).float().mean().item())
                 else:
                     tn_1 = batch_t_traj[n_1]
                     tn = batch_t_traj[(np.array(n_1) - 1).tolist()]
@@ -754,22 +821,53 @@ def train_on_trajectory(
                     with torch.no_grad():
                         z_init = init_model(current_func_args[0][:, :, -qlen:]).detach()
 
-                with torch.no_grad():
-                    out_tn_1 = cd_ema(x_tn_1, x_tn, tn_1.unsqueeze(0).expand(x_tn_1.size(0), -1), current_func_args)
                 optimizer.zero_grad()
-                loss_1 = F.mse_loss(
-                    cd(x_tn, x_tn_prev, tn.unsqueeze(0).expand(x_tn.size(0), -1), current_func_args),
-                    out_tn_1,
-                )
-                x_endpoint_steps = x_endpoint.unsqueeze(1).expand(-1, n_steps, -1, -1)
-                loss_2_x = cd(x_tn, x_tn_prev, tn.unsqueeze(0).expand(x_tn.size(0), -1), current_func_args)
-                loss_2 = F.smooth_l1_loss(loss_2_x, x_endpoint_steps)
-                global_loss = loss_2
-                if z_init is not None:
-                    t0 = torch.zeros(batch_size, 1, device=x_batch.device, dtype=batch_t_traj.dtype)
-                    anchor = cd(z_init.unsqueeze(1), z_init.unsqueeze(1), t0, current_func_args)
-                    global_loss = 0.5 * (loss_2 + F.smooth_l1_loss(anchor, x_endpoint.unsqueeze(1)))
-                loss = 0.1 * loss_1 + 0.9 * global_loss
+                if args.cm_continuous_time:
+                    with torch.no_grad():
+                        target = cd_ema(
+                            z_s,
+                            z_s,
+                            s.unsqueeze(0).expand(batch_size, -1),
+                            current_func_args,
+                        )
+                    prediction = cd(
+                        z_r,
+                        z_r,
+                        r.unsqueeze(0).expand(batch_size, -1),
+                        current_func_args,
+                    )
+                    if z_init is not None:
+                        t0 = torch.zeros(batch_size, 1, device=x_batch.device, dtype=batch_t_traj.dtype)
+                        init_prediction = cd(z_init.unsqueeze(1), z_init.unsqueeze(1), t0, current_func_args)
+                        prediction = torch.cat((prediction, init_prediction), dim=1)
+                        target = torch.cat((target, x_endpoint.unsqueeze(1).detach()), dim=1)
+                    loss = F.smooth_l1_loss(prediction, target)
+                else:
+                    with torch.no_grad():
+                        out_tn_1 = cd_ema(
+                            x_tn_1,
+                            x_tn,
+                            tn_1.unsqueeze(0).expand(batch_size, -1),
+                            current_func_args,
+                        )
+                    loss_1 = F.mse_loss(
+                        cd(x_tn, x_tn_prev, tn.unsqueeze(0).expand(batch_size, -1), current_func_args),
+                        out_tn_1,
+                    )
+                    x_endpoint_steps = x_endpoint.unsqueeze(1).expand(-1, n_steps, -1, -1)
+                    loss_2_x = cd(
+                        x_tn,
+                        x_tn_prev,
+                        tn.unsqueeze(0).expand(batch_size, -1),
+                        current_func_args,
+                    )
+                    loss_2 = F.smooth_l1_loss(loss_2_x, x_endpoint_steps)
+                    global_loss = loss_2
+                    if z_init is not None:
+                        t0 = torch.zeros(batch_size, 1, device=x_batch.device, dtype=batch_t_traj.dtype)
+                        anchor = cd(z_init.unsqueeze(1), z_init.unsqueeze(1), t0, current_func_args)
+                        global_loss = 0.5 * (loss_2 + F.smooth_l1_loss(anchor, x_endpoint.unsqueeze(1)))
+                    loss = 0.1 * loss_1 + 0.9 * global_loss
 
                 loss.backward()
                 optimizer.step()
@@ -807,12 +905,33 @@ def train_on_trajectory(
             epoch_rel_diff = sum(epoch_rel_diffs) / len(epoch_rel_diffs)
             if epoch_rel_diff < best_rel_diff:
                 best_rel_diff = epoch_rel_diff
-                save_cm_package(args.cm_save, cd, init_model=init_model, args=args, cm_global_step=cm_global_step)
+                save_cm_package(
+                    args.cm_save,
+                    cd,
+                    init_model=init_model,
+                    args=args,
+                    cm_global_step=cm_global_step,
+                    best_rel_diff=best_rel_diff,
+                )
+            schedule_stats = ""
+            postfix = {
+                "epoch": epoch + 1,
+                "loss": tot_loss,
+                "rel_diff": epoch_rel_diff,
+                "best": best_rel_diff,
+                "step": cm_global_step,
+            }
+            if args.cm_continuous_time:
+                alpha_mean = sum(epoch_alphas) / len(epoch_alphas)
+                endpoint_rate = sum(epoch_endpoint_rates) / len(epoch_endpoint_rates)
+                schedule_stats = f", alpha_mean={alpha_mean:.6f}, endpoint_rate={endpoint_rate:.6f}"
+                postfix.update(alpha=alpha_mean, endpoint_rate=endpoint_rate)
             print(
                 f"CM epoch {epoch + 1}/{n_epochs}: "
-                f"loss={tot_loss:.6f}, rel_diff={epoch_rel_diff:.6f}, best_rel_diff={best_rel_diff:.6f}"
+                f"loss={tot_loss:.6f}, rel_diff={epoch_rel_diff:.6f}, "
+                f"best_rel_diff={best_rel_diff:.6f}, cm_global_step={cm_global_step}{schedule_stats}"
             )
-            pbar.set_postfix(epoch=epoch + 1, loss=tot_loss, rel_diff=epoch_rel_diff, best=best_rel_diff)
+            pbar.set_postfix(**postfix)
             pbar.update()
 
     return tot_loss, rel_diff_append, loss_append, params_ema, best_rel_diff, cm_global_step
@@ -850,6 +969,7 @@ def train_consistency_model(args, device, device_ids, func_params_dict):
         param.requires_grad = False
     params_ema = cd_ema.state_dict()
     cm_global_step = 0
+    best_rel_diff = float("inf")
 
     if device.type == "cuda" and len(device_ids) > 1:
         cd = nn.DataParallel(cd, device_ids=device_ids, dim=0).to(device)
@@ -864,20 +984,20 @@ def train_consistency_model(args, device, device_ids, func_params_dict):
                 f"CM checkpoint {args.cm_checkpoint} does not match {TRAJECTORY_FORMAT_VERSION}. "
                 "Use a fresh --cm-checkpoint path or delete the old checkpoint."
             )
+        validate_cm_checkpoint_config(checkpoint, args)
         module_of(cd).load_state_dict(checkpoint["model"])
         module_of(cd_ema).load_state_dict(checkpoint["model_ema"])
         params_ema = checkpoint["params_ema"]
         optimizer.load_state_dict(checkpoint["optimizer"])
         cm_global_step = checkpoint.get("cm_global_step", 0)
+        best_rel_diff = checkpoint.get("best_rel_diff", float("inf"))
         if init_model is not None:
-            if "init_model" not in checkpoint:
-                raise ValueError(
-                    f"CM checkpoint {args.cm_checkpoint} does not contain init_model. "
-                    "Use a fresh --cm-checkpoint path or omit --cdeq-init."
-                )
             module_of(init_model).load_state_dict(checkpoint["init_model"])
             init_optimizer.load_state_dict(checkpoint["init_optimizer"])
-        print(f"Loaded checkpoint from {args.cm_checkpoint}")
+        print(
+            f"Loaded checkpoint from {args.cm_checkpoint} "
+            f"(cm_global_step={cm_global_step}, best_rel_diff={best_rel_diff:.6f})"
+        )
     else:
         print(f"No checkpoint found at {args.cm_checkpoint}, starting from scratch.")
 
@@ -904,7 +1024,6 @@ def train_consistency_model(args, device, device_ids, func_params_dict):
         sampled_trajectories = [random.choice(all_trajectories) for _ in range(args.cm_num_samples)]
     print(f"随机抽取了 {args.cm_num_samples} 条轨迹进行训练（可能包含重复轨迹）")
 
-    best_rel_diff = float("inf")
     for idx, (file_idx, traj_idx) in enumerate(sampled_trajectories):
         print(f"正在处理第 {idx + 1}/{args.cm_num_samples} 条轨迹，来自文件 {args.trajectory_prefix}_{file_idx}.pt 中的第 {traj_idx} 条")
         traj = torch.load(f"{args.trajectory_prefix}_{file_idx}.pt", map_location=device)
@@ -980,23 +1099,16 @@ def train_consistency_model(args, device, device_ids, func_params_dict):
             "optimizer": optimizer.state_dict(),
             "cm_time_convention": TRAJECTORY_FORMAT_VERSION,
             "cm_global_step": cm_global_step,
+            "best_rel_diff": best_rel_diff,
+            "cm_continuous_time": args.cm_continuous_time,
+            "cm_schedule_version": CM_SCHEDULE_VERSION if args.cm_continuous_time else None,
+            "cm_ct_params": cm_ct_params(args),
+            "cdeq_init": args.cdeq_init,
         }
         if init_model is not None:
             checkpoint["init_model"] = module_of(init_model).state_dict()
             checkpoint["init_optimizer"] = init_optimizer.state_dict()
         torch.save(checkpoint, args.cm_checkpoint)
-        with torch.no_grad():
-            package = load_cm_package(args.cm_save, device, require_init=args.cdeq_init)
-            module_of(cd).load_state_dict(package["model"])
-            if init_model is None:
-                x_ini = x_list[0].unsqueeze(1)
-            else:
-                module_of(init_model).load_state_dict(package["init_model"])
-                x_ini = init_model(func_args[0][:, :, -x_traj.size(-1):]).unsqueeze(1)
-            t = torch.zeros(1, 1, device=device).expand(bsz, -1)
-            x = cd(x_ini, x_ini, t, func_args).squeeze(1)
-            rel_diff = (x - x_traj[:, -1]).norm() / x_traj[:, -1].norm()
-            print(f"Relative error: {rel_diff.item()}")
 
     print(f"所有 {args.cm_num_samples} 条轨迹训练完成，最佳模型已保存")
 

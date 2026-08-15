@@ -1,6 +1,6 @@
 # CDEQ Agent Notes
 
-Last updated: 2026-07-03.
+Last updated: 2026-08-15.
 
 ## Scope
 
@@ -44,10 +44,24 @@ Last updated: 2026-07-03.
    - `ConsistencyFunction` uses the same solver family as the saved trajectory:
      - Picard: train on `f(z_t)`.
      - Anderson: train on `anderson_step(z_t, z_{t-1}, f(z_t), f(z_{t-1}))`.
-   - Current distillation loss is simplified:
-     - local consistency: student output at the earlier point matches the stop-gradient EMA model at the later point, closer to the fixed-point endpoint.
-     - global consistency: output matches the final trajectory state.
-     - code uses `0.1 * local + 0.9 * global`.
+   - `--cm-continuous-time` enables Endpoint-Anchored Progressive Interval
+     Tightening (EA-PIT). It affects training only and supports Picard
+     trajectories only.
+   - EA-PIT uniformly samples a solver interval and then a point inside it:
+     `i ~ Uniform{0,...,K-1}`, `lambda ~ U(0,1)`,
+     `r = (1-lambda)*tau_i + lambda*tau_{i+1}`, and
+     `s_min = tau_{i+1}`.
+   - Its curriculum is
+     `alpha = min(1, (1 + k*sigmoid(-b*(T-r))) * q**(-floor(g/d)))` and
+     `s_g = s_min + alpha*(T-s_min)`, with defaults
+     `q=1.1`, `d=100`, `k=8`, and `b=1`.
+   - With probability `p_end=0.1`, the target time is `s=T`; otherwise it is
+     `s=s_g`. Training uses one pair loss:
+     `SmoothL1(C_student(z(r),r), stopgrad(C_ema(z(s),s)))`.
+   - `d` is measured in main CM optimizer updates; initializer-only updates do
+     not advance the EA-PIT curriculum.
+   - With continuous time disabled, the discrete CDEQ path keeps the existing
+     `0.1 * local + 0.9 * global` loss. Thus Init=0/PIT=0 remains ordinary CDEQ.
 
 4. Run CM inference.
    - Command mode: `-CM` or `--CM`.
@@ -63,7 +77,8 @@ The implementation matches the main CDEQ idea:
 - Fix a deterministic solver trajectory toward a DEQ equilibrium.
 - Cache teacher trajectory states.
 - Distill a consistency function over that trajectory.
-- Use global and local consistency with an EMA teacher.
+- Distill endpoint-to-local consistency with an EMA teacher; the CT-off
+  discrete path retains explicit global and local losses.
 - Replace many DEQ solver iterations with one/few CM inference steps.
 
 Important differences from the paper:
@@ -74,7 +89,8 @@ Important differences from the paper:
   - no full trajectory augmentation from the appendix,
   - no full task-level regularization term,
   - no complete multi-step inference time schedule,
-  - fixed loss weights instead of configurable `lambda_1/lambda_2`.
+  - fixed `0.1/0.9` weights in the CT-off discrete path; EA-PIT instead uses
+    one SmoothL1 pair loss in the continuous-time path.
 
 Conclusion: treat this as a CDEQ-compatible implementation of the paper's core idea, not a complete reproduction of every paper detail.
 
