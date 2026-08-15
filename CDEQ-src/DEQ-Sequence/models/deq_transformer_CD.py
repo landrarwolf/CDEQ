@@ -51,16 +51,65 @@ def interpolate_trajectory(x_traj, t_traj, t):
     return x_traj[:, left] * (1 - weight) + x_traj[:, right] * weight
 
 
-def sample_continuous_pair(t_traj, n_steps, global_step, q=1.1, d=100, k=8.0, b=1.0):
-    t_traj = t_traj.flatten()
-    eps, T = t_traj[0], t_traj[-1]
-    u = torch.rand(n_steps, device=t_traj.device, dtype=t_traj.dtype)
-    t = torch.exp(torch.log(eps) + u * (torch.log(T) - torch.log(eps)))
-    n_t = 1 + k * torch.sigmoid(-b * t)
-    q_power = q ** (global_step // max(int(d), 1))
-    r = t * (1 - n_t / q_power)
-    r = torch.minimum(r.clamp_min(eps), t)
-    return t, r
+def sample_ea_pit_pair(
+        t_traj, n_pairs, global_step, q=1.1, d=100, k=8.0, b=1.0,
+        p_end=0.1, generator=None):
+    if t_traj.ndim != 1:
+        raise ValueError("t_traj must be one-dimensional")
+    if t_traj.numel() < 2:
+        raise ValueError("t_traj must contain at least two points")
+    if not t_traj.is_floating_point():
+        raise ValueError("t_traj must use a floating-point dtype")
+    if not torch.isfinite(t_traj).all():
+        raise ValueError("t_traj must contain only finite values")
+    if not torch.all(t_traj[1:] > t_traj[:-1]):
+        raise ValueError("t_traj must be strictly increasing")
+    if t_traj[-1].item() != 5.0:
+        raise ValueError("t_traj must end at the CM boundary T=5")
+    if not np.isfinite((q, d, k, b, p_end)).all():
+        raise ValueError("EA-PIT schedule parameters must be finite")
+    if q <= 1 or k < 0 or b < 0 or not 0 <= p_end <= 1:
+        raise ValueError("EA-PIT requires q>1, k>=0, b>=0, and p_end in [0, 1]")
+    if isinstance(d, bool) or not isinstance(d, (int, np.integer)) or d <= 0:
+        raise ValueError("EA-PIT requires d to be a positive integer")
+    if isinstance(n_pairs, bool) or not isinstance(n_pairs, (int, np.integer)) or n_pairs <= 0:
+        raise ValueError("n_pairs must be a positive integer")
+    if isinstance(global_step, bool) or not isinstance(global_step, (int, np.integer)) or global_step < 0:
+        raise ValueError("global_step must be a non-negative integer")
+
+    n_pairs = int(n_pairs)
+    global_step = int(global_step)
+
+    interval = torch.randint(
+        t_traj.numel() - 1,
+        (n_pairs,),
+        device=t_traj.device,
+        generator=generator,
+    )
+    left, s_min = t_traj[interval], t_traj[interval + 1]
+    mix = torch.rand(
+        n_pairs,
+        device=t_traj.device,
+        dtype=t_traj.dtype,
+        generator=generator,
+    )
+    r = left + mix * (s_min - left)
+    r = torch.minimum(r, torch.nextafter(s_min, left))
+
+    T = t_traj[-1]
+    n_r = 1 + k * torch.sigmoid(-b * (T - r))
+    decay = q ** (-(global_step // d))
+    alpha = (n_r * decay).clamp_max(1)
+    s_g = s_min + alpha * (T - s_min)
+    s_g = torch.where(alpha == 1, T, s_g)
+    anchor = torch.rand(
+        n_pairs,
+        device=t_traj.device,
+        dtype=t_traj.dtype,
+        generator=generator,
+    ) < p_end
+    s = torch.where(anchor, T, s_g)
+    return r, s, alpha
 
 
 class WeightSharePositionwiseFF(nn.Module):
