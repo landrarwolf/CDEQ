@@ -1,5 +1,9 @@
 .DS_Store
 私钥.txt
+/Agent.md
+/analysis/
+/ADAPTIVE_CDEQ_PLUS_RESEARCH_IDEA.md
+/CDEQ_PLUS_CLLM_EXTENSION_PLAN.md
 **/__pycache__/
 *.py[cod]
 
